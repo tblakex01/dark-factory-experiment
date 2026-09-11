@@ -1,14 +1,46 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { type Citation, RateLimitError } from '../lib/api';
 
 export interface StreamResult {
   fullText: string;
-  sources: string[];
+  sources: Citation[];
 }
 
-export function useStreamingResponse() {
+export interface StreamingStatus {
+  tool: string;
+  subject: string;
+  /** Tool-aware human-readable label from the backend (issue #223).
+   *  May be '' if an older backend omits it — UI falls back to subject. */
+  label: string;
+}
+
+export function useStreamingResponse(conversationId: string | null) {
   const [streamingContent, setStreamingContent] = useState<string>('');
-  const [streamingSources, setStreamingSources] = useState<string[]>([]);
+  const [streamingSources, setStreamingSources] = useState<Citation[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingStatus, setStreamingStatus] = useState<StreamingStatus | null>(null);
+
+  const streamAbortRef = useRef<AbortController | null>(null);
+
+  // Reset all streaming state and abort any in-flight fetch when the
+  // conversation changes. Mirrors the reset pattern in useMessages.ts.
+  useEffect(() => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+    setIsStreaming(false);
+    setStreamingContent('');
+    setStreamingSources([]);
+    setStreamingStatus(null);
+  }, [conversationId]);
+
+  const abortStream = useCallback(() => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+  }, []);
 
   const startStream = useCallback(
     async (
@@ -19,19 +51,53 @@ export function useStreamingResponse() {
       setIsStreaming(true);
       setStreamingContent('');
       setStreamingSources([]);
+      setStreamingStatus(null);
 
       let fullText = '';
-      let sources: string[] = [];
+      let sources: Citation[] = [];
+      let streamError: Error | null = null;
 
       try {
+        const abortController = new AbortController();
+        streamAbortRef.current = abortController;
+
         const res = await fetch(`/api/conversations/${conversationId}/messages`, {
           method: 'POST',
+          credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: userMessage }),
+          signal: abortController.signal,
         });
 
+        if (res.status === 401) {
+          if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+            const returnTo = window.location.pathname + window.location.search;
+            window.location.assign(`/login?from=${encodeURIComponent(returnTo)}`);
+          }
+          throw new Error('Not authenticated');
+        }
+        if (res.status === 429) {
+          // MISSION §10 #1 — daily cap hit. Body: {error, limit, window_hours, reset_at}.
+          let body: Record<string, unknown> | null = null;
+          try {
+            body = await res.json();
+          } catch (jsonErr) {
+            console.warn('[useStreamingResponse] Failed to parse 429 body:', jsonErr);
+          }
+          if (body && typeof body === 'object' && 'limit' in body) {
+            throw new RateLimitError(
+              body as { limit: number; window_hours: number; reset_at: string },
+            );
+          }
+          throw new Error('Daily message limit reached');
+        }
         if (!res.ok) {
-          const errorText = await res.text().catch(() => '');
+          let errorText = '';
+          try {
+            errorText = await res.text();
+          } catch (textErr) {
+            console.warn('[useStreamingResponse] Failed to read error body:', textErr);
+          }
           throw new Error(`HTTP ${res.status}${errorText ? `: ${errorText}` : ''}`);
         }
         if (!res.body) throw new Error('No response body');
@@ -41,7 +107,12 @@ export function useStreamingResponse() {
         // Buffer for incomplete SSE data between reader.read() calls
         let buffer = '';
 
-        while (true) {
+        // Condition is `!streamError`, not `true`: the mid-stream error branch
+        // below can only `break` out of the inner per-event loop, and the
+        // server does not send [DONE] after an error. Left as `while (true)`,
+        // this kept calling reader.read() until the connection closed and then
+        // fell through to onComplete with a partial answer. Issue #244.
+        while (!streamError) {
           const { done, value } = await reader.read();
           if (done) break;
 
@@ -78,8 +149,34 @@ export function useStreamingResponse() {
                   sources = parsed;
                   setStreamingSources(parsed);
                 }
-              } catch {
-                // Ignore malformed sources
+              } catch (e) {
+                console.warn('[useStreamingResponse] Failed to parse sources event:', e);
+              }
+            } else if (eventType === 'status') {
+              try {
+                const parsed = JSON.parse(data);
+                if (parsed && typeof parsed === 'object' && 'type' in parsed) {
+                  if (parsed.type === 'tool_call_start') {
+                    setStreamingStatus({
+                      tool: String(parsed.tool ?? ''),
+                      subject: String(parsed.subject ?? ''),
+                      label: String(parsed.label ?? ''),
+                    });
+                  } else if (parsed.type === 'tool_call_done') {
+                    if (!parsed.tool || parsed.tool !== streamingStatus?.tool) {
+                      console.warn(
+                        '[useStreamingResponse] tool_call_done mismatch or missing tool:',
+                        parsed,
+                      );
+                    }
+                    // Hold the last status through tool_call_done so the indicator reads
+                    // as continuous progress. It is cleared when the next tool_call_start
+                    // arrives, when the first answer token lands, or when the stream ends
+                    // (see the content branch below and the finally block). Issue #223.
+                  }
+                }
+              } catch (e) {
+                console.warn('[useStreamingResponse] Failed to parse status event:', e);
               }
             } else if (data === '[DONE]') {
               // Stream complete — no action needed here
@@ -91,7 +188,11 @@ export function useStreamingResponse() {
               } catch {
                 // Use default message
               }
-              throw new Error(errMsg);
+              streamError = new Error(errMsg);
+              // Nothing further is coming, so release the connection rather
+              // than leaving the body un-drained now that we stop reading.
+              void reader.cancel().catch(() => {});
+              break;
             } else if (data) {
               // Tokens are JSON-encoded strings to safely handle newlines/special chars
               let token = data;
@@ -103,24 +204,37 @@ export function useStreamingResponse() {
               } catch {
                 // Not JSON-encoded — use raw data (backward compat)
               }
+              setStreamingStatus(null);
               fullText += token;
               setStreamingContent(fullText);
             }
           }
         }
 
-        // Stream completed successfully
-        onComplete({ fullText, sources });
+        // Only on a clean finish. On a mid-stream error the caller persists
+        // nothing and the throw below surfaces it instead.
+        if (!streamError) {
+          onComplete({ fullText, sources });
+        }
       } finally {
         // Always reset streaming state — React 18 batches this with the onComplete
         // state updates, ensuring a seamless transition to the persisted message.
         setIsStreaming(false);
         setStreamingContent('');
         setStreamingSources([]);
+        setStreamingStatus(null);
       }
+      if (streamError) throw streamError;
     },
     [],
   );
 
-  return { streamingContent, streamingSources, isStreaming, startStream };
+  return {
+    streamingContent,
+    streamingSources,
+    streamingStatus,
+    isStreaming,
+    startStream,
+    abortStream,
+  };
 }

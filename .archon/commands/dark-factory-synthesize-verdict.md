@@ -115,9 +115,10 @@ Approve if ALL of:
 2. Backend tests: pytest output shows `passed` count > 0 and no `failed`, OR explicitly skipped with a recorded reason per FACTORY_RULES.md
 3. Frontend tests: vitest output shows `passed` count > 0 and no `failed`, OR explicitly skipped with a recorded reason
 4. `behavioral-validation.solves_issue == "yes"` AND `scope_appropriate == "yes"` AND `regressions_detected` is empty
-5. `security-check.verdict == "pass"` AND `governance_files_modified == false`
-6. `code-review` finds no critical or high severity issues (medium and low are acceptable and documented for follow-up)
-7. `behavioral-validation.confidence != "low"` — low confidence behavioral verdicts never auto-approve, they become request_changes
+5. **Agent-browser E2E gate (mandatory per FACTORY_RULES §3.3 + §4)**: EITHER `behavioral-e2e.solves_issue == "yes"` AND `behavioral-e2e.app_booted == true` AND `regressions_observed` is empty, OR `behavioral-e2e.solves_issue == "not_e2e_testable"` AND `behavioral-e2e.app_booted == true` (used only when the diff legitimately has no UI surface — pure internal refactor, docs, background-job tweak). `app_booted == false` is never approve-compatible; if it's false, rule 0 already fired.
+6. `security-check.verdict == "pass"` AND `governance_files_modified == false`
+7. `code-review` finds no critical or high severity issues (medium and low are acceptable and documented for follow-up)
+8. `behavioral-validation.confidence != "low"` — low confidence behavioral verdicts never auto-approve, they become request_changes
 
 ### REQUEST_CHANGES — send back to dark-factory-fix-pr
 

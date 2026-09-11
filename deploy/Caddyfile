@@ -1,0 +1,13 @@
+{
+    email cole@dynamous.ai
+}
+
+chat.dynamous.ai {
+    encode zstd gzip
+
+    # Which app container is live is decided by upstream.conf, which the
+    # deploy script (/opt/dynachat/deploy.sh) rewrites on each blue/green
+    # swap and then triggers a graceful `caddy reload`. FastAPI serves
+    # both /api/* and the built frontend static assets from the same origin.
+    import /etc/caddy/upstream.conf
+}

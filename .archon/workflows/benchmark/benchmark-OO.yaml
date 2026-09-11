@@ -1,0 +1,207 @@
+name: benchmark-OO
+description: |
+  Use when: Measuring the optimal mix-provider configuration for issue resolution.
+  Cell: plan=Opus, impl=Opus.
+  Does: Stripped 6-node fix-an-issue pipeline. Explore + self-review held constant
+        on Sonnet (Claude). Plan + implement vary per workflow file. This file is
+        the Opus/Opus cell. The PR is labeled `benchmark:OO` (NOT `factory:*`),
+        so the dark-factory orchestrator ignores it. Draft PRs only.
+  NOT for: Production dark-factory dispatch (use dark-factory-fix-github-issue).
+
+# Default provider for held-constant nodes (explore, self-review).
+# Sonnet — fast enough that the held-constant cost doesn't dominate the variable
+# cells, and strong enough to do honest exploration and review.
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fetch-issue
+    bash: |
+      set -euo pipefail
+      ISSUE_NUM=$(echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "ERROR: No issue number in arguments: $ARGUMENTS" >&2
+        exit 1
+      fi
+      echo "$ISSUE_NUM" > "$ARTIFACTS_DIR/.issue-number"
+      gh issue view "$ISSUE_NUM" --json number,title,body,labels,author,createdAt
+    timeout: 20000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: EXPLORE (held constant — Sonnet)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: explore
+    prompt: |
+      You are a codebase explorer. Read the issue and gather context needed
+      to plan a fix. Do NOT edit anything in this node.
+
+      ## Issue
+      $fetch-issue.output
+
+      ## Instructions
+
+      Use Read, Grep, and Glob to explore the repository. Look for:
+      - Files and modules involved in the issue
+      - Existing patterns and conventions to follow
+      - Tests that cover the affected code
+      - Constraints in CLAUDE.md, MISSION.md, or FACTORY_RULES.md
+
+      Write your output to `$ARTIFACTS_DIR/exploration.md` with sections:
+      - **What the issue asks**: one paragraph rephrasing the issue
+      - **Relevant files**: bullet list with paths
+      - **Relevant patterns**: any code patterns or constraints the fix must respect
+      - **Risks / edge cases**: what could go wrong
+
+      Keep it focused — under 500 words. Do NOT propose a solution here; that's
+      the planner's job.
+    depends_on: [fetch-issue]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: PLAN (variable — Opus for OO cell)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: plan
+    prompt: |
+      You are a planner. Based on the issue and exploration, write a concrete
+      implementation plan.
+
+      ## Issue
+      $fetch-issue.output
+
+      ## Exploration
+      Read `$ARTIFACTS_DIR/exploration.md`.
+
+      ## Instructions
+
+      Write your plan to `$ARTIFACTS_DIR/plan.md` with sections:
+      - **Approach**: one paragraph
+      - **Files to change**: bullet list with paths and brief reason per file
+      - **Specific changes**: ordered bullet list of code edits (function names,
+        line ranges if known, what to add/remove/replace)
+      - **Tests**: what tests to add or update
+      - **Out of scope**: what NOT to touch (be explicit — scope discipline matters)
+
+      Prefer minimal, surgical changes. If the issue can be fixed in 10 lines,
+      do not propose 100. Do NOT execute any edits here — only write the plan.
+    provider: claude
+    model: opus
+    depends_on: [explore]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: IMPLEMENT (variable — Opus for OO cell)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    prompt: |
+      You are the implementer. Execute the plan exactly as written.
+
+      ## Issue
+      $fetch-issue.output
+
+      ## Plan
+      Read `$ARTIFACTS_DIR/plan.md` for what to do and
+      `$ARTIFACTS_DIR/exploration.md` for context.
+
+      ## Instructions
+
+      1. Make the edits the plan calls for. Use Read/Edit/Write/Bash tools.
+      2. Stay strictly in scope. Only touch files the plan lists. If the plan
+         is wrong, write your concerns to `$ARTIFACTS_DIR/impl-notes.md` but
+         still execute the plan faithfully — the experiment measures the
+         planner too.
+      3. Run cheap sanity checks if applicable (e.g. import the module to check
+         for syntax errors). Do NOT run the full test suite or build — that's
+         not the implementer's job here.
+      4. When done editing, stage your changes:
+         `git add -A && git commit -m "impl: address issue"`
+      5. Do NOT push or create a PR — the create-pr node handles that.
+    provider: claude
+    model: opus
+    depends_on: [plan]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: SELF-REVIEW + FIX (held constant — Sonnet)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: self-review
+    prompt: |
+      You are an independent reviewer. Read the current diff and review it
+      against the issue and the plan.
+
+      ## Issue
+      $fetch-issue.output
+
+      ## Plan
+      Read `$ARTIFACTS_DIR/plan.md`.
+
+      ## Instructions
+
+      1. Run `git diff main...HEAD` (or `git log -p -1`) to see what changed.
+      2. Critique the diff for:
+         - **Solves the issue?** Does the change actually address what was asked?
+         - **Subtle correctness**: async/await, types, edge cases, off-by-ones,
+           cache/state lifecycle, regex backtracking — the foot-guns that pass
+           a quick read but break at the boundary.
+         - **Scope creep**: did the implementer touch anything not in the plan?
+         - **Missing tests**: are there test cases that should exist?
+      3. Fix anything you find. Use Edit/Write tools to make corrections.
+         DO NOT add new scope — only correct what's already there.
+      4. If you make changes, commit them:
+         `git add -A && git commit -m "review: address self-review findings"`
+      5. If nothing needs fixing, write `NOTHING_TO_FIX` to
+         `$ARTIFACTS_DIR/review-result.txt`. Otherwise write a brief summary
+         of what you fixed to the same file.
+    depends_on: [implement]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: CREATE DRAFT PR (deterministic bash)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    bash: |
+      set -euo pipefail
+      ISSUE_NUM=$(cat "$ARTIFACTS_DIR/.issue-number")
+      BRANCH=$(git branch --show-current)
+      CELL="OO"
+      CELL_DESC="plan=Opus, impl=Opus"
+      # Extract this workflow's run-id from $ARTIFACTS_DIR for the evaluator
+      RUN_ID=$(basename "$ARTIFACTS_DIR")
+
+      # Push the branch
+      git push -u origin "$BRANCH"
+
+      # Build the PR body (run-id lets the evaluator find plan.md + exploration.md)
+      BODY="Fixes #${ISSUE_NUM}
+
+      **Benchmark cell:** \`${CELL}\` (${CELL_DESC})
+      **Source run-id:** \`${RUN_ID}\`
+
+      Held-constant: explore + self-review on Sonnet.
+
+      Produced by the mixed-provider routing benchmark.
+      See \`benchmark-evaluator\` workflow for the scored verdict."
+
+      # Create draft PR with benchmark label only (NOT factory:*)
+      PR_URL=$(gh pr create \
+        --draft \
+        --title "[bench-${CELL}] $(git log -1 --pretty=%s)" \
+        --body "$BODY" \
+        --label "benchmark:${CELL}")
+
+      echo "Created draft PR: $PR_URL"
+
+      # Capture PR number for downstream tooling
+      PR_NUM=$(echo "$PR_URL" | grep -oE '[0-9]+$' | tail -1)
+      echo "$PR_NUM" > "$ARTIFACTS_DIR/.pr-number"
+      echo "PR #${PR_NUM}"
+    depends_on: [self-review]
+    timeout: 60000

@@ -1,8 +1,35 @@
-import { useState } from 'react';
-import { BrowserRouter, Route, Routes, useParams } from 'react-router-dom';
+import { type ReactNode, useRef, useState } from 'react';
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { ChatArea } from './components/ChatArea';
 import { Sidebar } from './components/Sidebar';
 import { ToastProvider } from './components/ToastProvider';
+import { AuthProvider, useAuth } from './hooks/useAuth';
+import { AdminVideos } from './pages/AdminVideos';
+import { Login } from './pages/Login';
+import { NotFound } from './pages/NotFound';
+import { Signup } from './pages/Signup';
+
+// ── Auth guard ───────────────────────────────────────────────────
+interface RequireAuthProps {
+  children: ReactNode;
+}
+
+function RequireAuth({ children }: RequireAuthProps) {
+  const { status } = useAuth();
+  const location = useLocation();
+
+  if (status === 'loading') {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[var(--bg)] text-[var(--text-secondary)]">
+        Loading…
+      </div>
+    );
+  }
+  if (status === 'anon') {
+    return <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />;
+  }
+  return <>{children}</>;
+}
 
 // ── Layout wrapper used by all routes ────────────────────────────
 interface AppLayoutProps {
@@ -11,6 +38,10 @@ interface AppLayoutProps {
 
 function AppLayout({ conversationId }: AppLayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // Shared ref so ChatArea can trigger a sidebar conversation refresh
+  const conversationsRef = useRef<(() => Promise<void>) | null>(null) as React.MutableRefObject<
+    (() => Promise<void>) | null
+  >;
 
   return (
     <div className="app-layout">
@@ -21,6 +52,7 @@ function AppLayout({ conversationId }: AppLayoutProps) {
         activeConversationId={conversationId}
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
+        conversationsRef={conversationsRef}
       />
 
       <div className="main-area">
@@ -45,7 +77,7 @@ function AppLayout({ conversationId }: AppLayoutProps) {
           </svg>
         </button>
 
-        <ChatArea conversationId={conversationId} />
+        <ChatArea conversationId={conversationId} refreshConversationsRef={conversationsRef} />
       </div>
     </div>
   );
@@ -58,19 +90,46 @@ function ConversationPage() {
 }
 
 function LandingPage() {
-  return <AppLayout conversationId={undefined} />;
+  return <AppLayout />;
 }
 
 // ── Root app ─────────────────────────────────────────────────────
 function App() {
   return (
     <BrowserRouter>
-      <ToastProvider>
-        <Routes>
-          <Route path="/" element={<LandingPage />} />
-          <Route path="/c/:conversationId" element={<ConversationPage />} />
-        </Routes>
-      </ToastProvider>
+      <AuthProvider>
+        <ToastProvider>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route path="/signup" element={<Signup />} />
+            <Route
+              path="/"
+              element={
+                <RequireAuth>
+                  <LandingPage />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/c/:conversationId"
+              element={
+                <RequireAuth>
+                  <ConversationPage />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/admin"
+              element={
+                <RequireAuth>
+                  <AdminVideos />
+                </RequireAuth>
+              }
+            />
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+        </ToastProvider>
+      </AuthProvider>
     </BrowserRouter>
   );
 }

@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily trigger for DynaChat YouTube channel sync
+Requires=dynachat-channel-sync.service
+
+[Timer]
+# Once a day at 00:00 UTC ± 30min jitter. Persistent=true catches up if the
+# host was down at the scheduled time so we don't silently skip days across
+# maintenance windows. Cole publishes new videos infrequently enough that
+# hourly was overkill and a daily cadence keeps Supadata calls cheap.
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+Unit=dynachat-channel-sync.service
+
+[Install]
+WantedBy=timers.target

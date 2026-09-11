@@ -44,6 +44,9 @@ $run-tests-frontend-p2.output
 ### Behavioral Validation (the holdout verdict)
 $behavioral-validation-p2.output
 
+### E2E Behavioral Validation (agent-browser)
+$behavioral-e2e-p2.output
+
 ### Security Check
 $security-check-p2.output
 
@@ -56,6 +59,32 @@ $fetch-base-governance.output
 ---
 
 ## Verdict Rules (apply in order — first match wins)
+
+### REJECT (rule 0) — infrastructure failure, escalate to human
+
+Pass-2 runs after a fix cycle. The app is already running from Phase 2 and uvicorn/vite hot-reload should have picked up the fix, so start-app is NOT re-run here. That means we check app health through the reviewer outputs instead of a `start-app.output` marker.
+
+- `$behavioral-e2e-p2.output.app_booted` must be `true`. If `false`, the agent-browser reviewer observed the app was not accepting requests and the mandatory end-to-end regression could not run.
+- `$behavioral-e2e-p2.output` must not be empty. An empty output here means the node was skipped because its upstream dependency (fix-issues) failed.
+- Any of `$static-checks-backend-p2.output`, `$static-checks-frontend-p2.output`, `$run-tests-backend-p2.output`, `$run-tests-frontend-p2.output` being empty (no content at all — meaning the node was skipped because its upstream failed) is also an infrastructure failure.
+
+**FORBIDDEN escape hatch — read carefully.** `not_e2e_testable` is a legitimate enum value when the *diff* legitimately cannot be exercised through the browser (pure internal refactor, docs-only change, background-job tweak with no UI surface). It does NOT mean "the E2E node didn't produce output" or "the app crashed during the fix." If `behavioral-e2e-p2.app_booted` is `false`, or `$behavioral-e2e-p2.output` is empty, you are **FORBIDDEN** from returning `e2e_status: "not_e2e_testable"` or `behavioral_status: "not_e2e_testable"`. Those are infrastructure failures and you MUST fire rule 0 with `e2e_status: "no"` and `behavioral_status: "no"`.
+
+In any of those cases, return:
+
+- `verdict`: `"reject"`
+- `should_escalate`: `true`
+- `escalation_reason`: `"Validator infrastructure failed during pass-2 — fix cycle left the app unbootable or upstream nodes were skipped, so static checks, tests, and E2E regression never ran. Manual investigation required before retrying."`
+- `summary`: `"Pass-2 validator prerequisites failed; cannot render a substantive verdict."`
+- `static_checks_status`: `"fail"`
+- `tests_status`: `"fail"`
+- `behavioral_status`: `"no"`
+- `e2e_status`: `"no"`
+- `security_status`: `"fail"`
+- `issues_to_fix`: `[]`
+- `reasoning`: `"REJECT rule 0 (infrastructure) fired. [Which specific marker/input was missing and why this blocks a substantive verdict.]"`
+
+This is NOT a defect in the PR under review — it's a validator-side failure (or the fix cycle broke the running app). The escalation flag routes it to a human who can investigate the infra issue rather than re-queuing the underlying issue. Rule 0 takes absolute precedence over every other rule below; do not even evaluate rules 1-7 if rule 0 fires.
 
 ### REJECT — automatic, no fix attempts, close the PR
 
@@ -79,9 +108,10 @@ Approve if ALL of:
 2. Backend tests: pytest output shows `passed` count > 0 and no `failed`, OR explicitly skipped with a recorded reason per FACTORY_RULES.md
 3. Frontend tests: vitest output shows `passed` count > 0 and no `failed`, OR explicitly skipped with a recorded reason
 4. `behavioral-validation.solves_issue == "yes"` AND `scope_appropriate == "yes"` AND `regressions_detected` is empty
-5. `security-check.verdict == "pass"` AND `governance_files_modified == false`
-6. `code-review` finds no critical or high severity issues (medium and low are acceptable and documented for follow-up)
-7. `behavioral-validation.confidence != "low"` — low confidence behavioral verdicts never auto-approve, they become request_changes
+5. **Agent-browser E2E gate (mandatory per FACTORY_RULES §3.3 + §4)**: EITHER `behavioral-e2e-p2.solves_issue == "yes"` AND `behavioral-e2e-p2.app_booted == true` AND `regressions_observed` is empty, OR `behavioral-e2e-p2.solves_issue == "not_e2e_testable"` AND `behavioral-e2e-p2.app_booted == true` (used only when the diff legitimately has no UI surface — pure internal refactor, docs, background-job tweak). `app_booted == false` is never approve-compatible; if it's false, rule 0 already fired.
+6. `security-check.verdict == "pass"` AND `governance_files_modified == false`
+7. `code-review` finds no critical or high severity issues (medium and low are acceptable and documented for follow-up)
+8. `behavioral-validation.confidence != "low"` — low confidence behavioral verdicts never auto-approve, they become request_changes
 
 ### REQUEST_CHANGES — send back to dark-factory-fix-pr
 

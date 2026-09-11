@@ -1,5 +1,13 @@
 # Mission
 
+**Derived from:** `docs/dynachat.prd.md`
+**Last reconciled with that PRD:** 2026-08-12
+
+> This file is the PRD compressed to the part the factory has to obey. When the product
+> changes, both files change in the same commit - otherwise the factory keeps faithfully
+> building the old scope and nothing warns you. The PRD is a live document here, not a
+> kickoff artifact.
+
 ## What DynaChat Is
 
 DynaChat is a RAG-powered chat interface that lets viewers ask questions about a single YouTube channel's back catalog and get answers grounded in the actual video content. Every answer cites the videos it came from, with deep-links that jump straight to the timestamp where the relevant moment happens.

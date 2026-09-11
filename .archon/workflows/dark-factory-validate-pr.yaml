@@ -166,18 +166,38 @@ nodes:
       #   fatal: branch 'X' is already used by worktree at '...'
       # So we proactively discover any other worktree holding this PR's
       # branch and force-remove it. Idempotent: no-op on a clean repo.
+      #
+      # Self-skip: if the CURRENT worktree happens to hold the PR branch
+      # already (e.g., a prior dispatch on the same `--branch` name reused
+      # this worktree directory), we must NOT try to remove ourselves —
+      # that corrupts our own .git pointer mid-run.
+      #
+      # We compare against `git rev-parse --show-toplevel` rather than
+      # `$(pwd)` because on Windows Git Bash, `$(pwd)` can return a path
+      # with different casing / separator normalization than what
+      # `git worktree list --porcelain` emits, causing the self-skip
+      # guard to fail silently. `git rev-parse --show-toplevel` emits
+      # the git-canonical path in the same format the porcelain listing
+      # uses, so string equality is reliable.
       PR_BRANCH=$(gh pr view "$PR_NUMBER" --json headRefName -q '.headRefName')
       if [ -n "$PR_BRANCH" ]; then
         echo "Checking for stale worktrees holding branch '$PR_BRANCH'..."
         git worktree prune
+        CURRENT_WT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+        echo "Current worktree (canonical): $CURRENT_WT"
         git worktree list --porcelain | awk -v b="$PR_BRANCH" '
           /^worktree / {w=$2}
           $0 == "branch refs/heads/" b {print w}
         ' | while read -r stale_wt; do
-          if [ -n "$stale_wt" ] && [ "$stale_wt" != "$(pwd)" ]; then
-            echo "Removing stale worktree: $stale_wt"
-            git worktree remove --force "$stale_wt" 2>&1 || true
+          if [ -z "$stale_wt" ]; then
+            continue
           fi
+          if [ "$stale_wt" = "$CURRENT_WT" ]; then
+            echo "Skipping self (current worktree holds PR branch): $stale_wt"
+            continue
+          fi
+          echo "Removing stale worktree: $stale_wt"
+          git worktree remove --force "$stale_wt" 2>&1 || true
         done
         git worktree prune
       fi
@@ -192,6 +212,12 @@ nodes:
       # fetch-base-governance artifact BEFORE this checkout, so the
       # holdout property is preserved either way.
       git fetch origin main --quiet
+      # Discard any local changes in infra dirs before overlaying main's
+      # versions. Without this, `git checkout origin/main -- .archon/`
+      # fails when the worktree was created from a stale commit and the
+      # infra files have been modified since (e.g., we just pushed a
+      # workflow fix to main).
+      git checkout -- .archon/ .claude/ 2>/dev/null || true
       git checkout origin/main -- .archon/ .claude/ 2>/dev/null || true
       # Reset any infra path that doesn't exist on main rather than failing.
       echo "Synced .archon/ and .claude/ from origin/main:"
@@ -208,21 +234,30 @@ nodes:
   - id: allocate-ports
     bash: |
       set -euo pipefail
-      # Find a free port in a given range by trying to bind it.
+      # Backend MUST use port 8000. The Vite dev server proxy in
+      # vite.config.ts is hardcoded to forward /api/* to localhost:8000.
+      # The frontend code (api.ts) uses relative `/api/...` paths that
+      # go through this proxy. Using a dynamic backend port breaks all
+      # browser-based validation because the proxy target doesn't match.
+      BACKEND_PORT=8000
+      if (echo >/dev/tcp/127.0.0.1/$BACKEND_PORT) 2>/dev/null; then
+        echo "ERROR: port $BACKEND_PORT already in use - cannot start backend" >&2
+        exit 1
+      fi
+
+      # Frontend port can be dynamic - agent-browser reads it from the
+      # artifact file and connects directly.
       find_free_port() {
-        local start=$1
-        local end=$2
+        local start=$1 end=$2
         for port in $(seq $start $end); do
           if ! (echo >/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
-            echo $port
-            return 0
+            echo $port; return 0
           fi
         done
-        echo "ERROR: no free port in range $start-$end" >&2
-        return 1
+        echo "ERROR: no free port in range $start-$end" >&2; return 1
       }
-      BACKEND_PORT=$(find_free_port 18000 18999)
       FRONTEND_PORT=$(find_free_port 15100 15999)
+
       echo "$BACKEND_PORT"  > "$ARTIFACTS_DIR/.backend-port"
       echo "$FRONTEND_PORT" > "$ARTIFACTS_DIR/.frontend-port"
       echo "Allocated backend=$BACKEND_PORT frontend=$FRONTEND_PORT"
@@ -238,13 +273,69 @@ nodes:
       echo ""
       echo "=== Frontend deps (bun install) ==="
       (cd app/frontend && bun install 2>&1 | tail -10)
+      echo ""
+      # Warm the mypy cache. Cold mypy on this backend exceeds the 2-min
+      # bash-node default timeout and SIGTERMs static-checks-backend-p1;
+      # a warm .mypy_cache/ lets the next mypy run complete in seconds.
+      # All DAG nodes in a run share this worktree, so the cache we populate
+      # here is the cache static-checks-backend-p1 (and -p2) will hit.
+      # Type errors are non-fatal here — the cache populates regardless,
+      # and the real verdict comes from the dedicated static-checks nodes.
+      echo "=== Warming mypy cache ==="
+      (cd app/backend && uv run mypy . 2>&1 | tail -3) || true
     depends_on: [checkout-pr]
-    idle_timeout: 300000
+    # Bash nodes ignore idle_timeout — only `timeout` is honored (default
+    # 120000ms). Must set explicitly: uv sync + bun install + cold mypy
+    # together can run 3-5 minutes on a fresh worktree.
+    timeout: 600000
 
   - id: start-app
     bash: |
       set -euo pipefail
       export PATH="$HOME/.local/bin:$PATH"
+
+      # Load the validation-sandbox env file. The backend now hard-requires
+      # DATABASE_URL (Postgres) and other secrets at import time; without this
+      # sourcing step, uvicorn crashes before the health check ever responds
+      # and the E2E reviewer never gets a running app to drive. That used to
+      # silently degrade to `e2e_status: "not_e2e_testable"` and slip past the
+      # synthesizer — apply-verdict now has a deterministic backstop, but the
+      # real fix is making start-app actually work.
+      #
+      # The env file lives OUTSIDE the repo (it contains secrets and must not
+      # be committed). Path is overridable via DARK_FACTORY_VALIDATION_ENV;
+      # defaults to /opt/dark-factory/validation.env on the VPS. Any VPS where
+      # this workflow runs must have that file populated with at minimum:
+      #   DATABASE_URL, OPENROUTER_API_KEY, JWT_SECRET, SUPADATA_API_KEY,
+      #   YOUTUBE_CHANNEL_ID
+      # Use a DEDICATED validation database URL — not production — so E2E runs
+      # can't pollute real user data.
+      VALIDATION_ENV="${DARK_FACTORY_VALIDATION_ENV:-/opt/dark-factory/validation.env}"
+      if [ -f "$VALIDATION_ENV" ]; then
+        echo "Loading validation env from $VALIDATION_ENV"
+        set -a
+        # shellcheck disable=SC1090
+        . "$VALIDATION_ENV"
+        set +a
+      else
+        echo "WARN: validation env file not found at $VALIDATION_ENV" >&2
+        echo "WARN: backend will likely fail to boot without DATABASE_URL and friends" >&2
+      fi
+
+      # Fail fast with a clear message if required vars are missing. Better
+      # to die here with a diagnosable error than to watch uvicorn crash at
+      # import and confuse the E2E reviewer into `not_e2e_testable`.
+      REQUIRED_VARS=(DATABASE_URL OPENROUTER_API_KEY JWT_SECRET SUPADATA_API_KEY YOUTUBE_CHANNEL_ID)
+      MISSING=()
+      for v in "${REQUIRED_VARS[@]}"; do
+        if [ -z "${!v:-}" ]; then MISSING+=("$v"); fi
+      done
+      if [ ${#MISSING[@]} -gt 0 ]; then
+        echo "ERROR: required env vars missing for validation sandbox: ${MISSING[*]}" >&2
+        echo "ERROR: populate $VALIDATION_ENV (outside the repo) and retry." >&2
+        exit 1
+      fi
+
       # Normal path: ports come from the find-free-ports node via artifacts.
       # Demo/manual path: if the port files are missing (e.g. someone ran this
       # node in isolation), fall back to sensible defaults and write them so
@@ -252,7 +343,7 @@ nodes:
       if [ -f "$ARTIFACTS_DIR/.backend-port" ]; then
         BACKEND_PORT=$(cat "$ARTIFACTS_DIR/.backend-port")
       else
-        BACKEND_PORT=18000
+        BACKEND_PORT=8000
         echo "$BACKEND_PORT" > "$ARTIFACTS_DIR/.backend-port"
         echo "WARN: .backend-port missing, defaulting to $BACKEND_PORT" >&2
       fi
@@ -327,22 +418,28 @@ nodes:
       set +e
       export PATH="$HOME/.local/bin:$PATH"
       cd app/backend
+      # ${PIPESTATUS[0]} captures the real command's exit, not `tail`'s.
+      # Plain $? after a pipe reads tail's exit (always 0), silently
+      # masking ruff/mypy failures.
       echo "=== ruff check ==="
       uv run ruff check . 2>&1 | tail -30
-      RUFF_LINT=$?
+      RUFF_LINT=${PIPESTATUS[0]}
       echo ""
       echo "=== ruff format --check ==="
       uv run ruff format --check . 2>&1 | tail -30
-      RUFF_FMT=$?
+      RUFF_FMT=${PIPESTATUS[0]}
       echo ""
       echo "=== mypy ==="
       uv run mypy . 2>&1 | tail -30
-      MYPY=$?
+      MYPY=${PIPESTATUS[0]}
       echo ""
       echo "RESULT: ruff-lint=$([ $RUFF_LINT -eq 0 ] && echo PASS || echo FAIL) ruff-fmt=$([ $RUFF_FMT -eq 0 ] && echo PASS || echo FAIL) mypy=$([ $MYPY -eq 0 ] && echo PASS || echo FAIL)"
       [ $RUFF_LINT -eq 0 ] && [ $RUFF_FMT -eq 0 ] && [ $MYPY -eq 0 ]
     depends_on: [install-deps]
-    idle_timeout: 180000
+    # Bash nodes honor `timeout`, not `idle_timeout`. Even with a warm
+    # .mypy_cache from install-deps, ruff + mypy on a fresh worktree
+    # occasionally runs >2 minutes — give it real headroom.
+    timeout: 300000
 
   - id: static-checks-frontend-p1
     bash: |
@@ -359,7 +456,11 @@ nodes:
       echo "RESULT: tsc=$([ $TSC -eq 0 ] && echo PASS || echo FAIL) biome=$([ $BIOME -eq 0 ] && echo PASS || echo FAIL)"
       [ $TSC -eq 0 ] && [ $BIOME -eq 0 ]
     depends_on: [install-deps]
-    idle_timeout: 180000
+    # Bash nodes honor `timeout`, not `idle_timeout`. tsc on a cold worktree
+    # plus biome check routinely clears 2 min — the default bash timeout
+    # would SIGTERM mid-run and leave `| tail -30`'s buffer unflushed, so
+    # Archon captures empty stdout and the synthesizer reads infra failure.
+    timeout: 180000
 
   - id: run-tests-backend-p1
     bash: |
@@ -374,7 +475,9 @@ nodes:
       echo ""
       echo "TEST_RESULT_BACKEND=$([ $? -eq 0 ] && echo PASS || echo FAIL)"
     depends_on: [install-deps]
-    idle_timeout: 300000
+    # Bash nodes honor `timeout`, not `idle_timeout`. pytest -xvs against
+    # the real Postgres can exceed 2 min once the suite has >100 tests.
+    timeout: 300000
 
   - id: run-tests-frontend-p1
     bash: |
@@ -388,7 +491,8 @@ nodes:
       echo ""
       echo "TEST_RESULT_FRONTEND=$([ $? -eq 0 ] && echo PASS || echo FAIL)"
     depends_on: [install-deps]
-    idle_timeout: 300000
+    # Bash nodes honor `timeout`, not `idle_timeout`.
+    timeout: 300000
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 4: PASS-1 HOLDOUT REVIEWERS (parallel, fresh context)
@@ -604,19 +708,26 @@ nodes:
       set +e
       export PATH="$HOME/.local/bin:$PATH"
       cd app/backend
+      # ${PIPESTATUS[0]} captures the real command's exit, not `tail`'s.
+      # Plain $? after a pipe reads tail's exit (always 0), silently
+      # masking ruff/mypy failures.
       echo "=== ruff check ==="
-      uv run ruff check . 2>&1 | tail -30; RUFF_LINT=$?
+      uv run ruff check . 2>&1 | tail -30; RUFF_LINT=${PIPESTATUS[0]}
       echo ""
       echo "=== ruff format --check ==="
-      uv run ruff format --check . 2>&1 | tail -30; RUFF_FMT=$?
+      uv run ruff format --check . 2>&1 | tail -30; RUFF_FMT=${PIPESTATUS[0]}
       echo ""
       echo "=== mypy ==="
-      uv run mypy . 2>&1 | tail -30; MYPY=$?
+      uv run mypy . 2>&1 | tail -30; MYPY=${PIPESTATUS[0]}
       echo ""
       echo "RESULT: ruff-lint=$([ $RUFF_LINT -eq 0 ] && echo PASS || echo FAIL) ruff-fmt=$([ $RUFF_FMT -eq 0 ] && echo PASS || echo FAIL) mypy=$([ $MYPY -eq 0 ] && echo PASS || echo FAIL)"
       [ $RUFF_LINT -eq 0 ] && [ $RUFF_FMT -eq 0 ] && [ $MYPY -eq 0 ]
     depends_on: [fix-issues]
-    idle_timeout: 180000
+    # Bash nodes honor `timeout`, not `idle_timeout`. The mypy cache from
+    # install-deps is already warm; p2 runs after fix-issues pushed code,
+    # so most changed modules need re-checking but most of the tree is
+    # cached. 5 min is generous headroom.
+    timeout: 300000
 
   - id: static-checks-frontend-p2
     bash: |
@@ -631,7 +742,8 @@ nodes:
       echo "RESULT: tsc=$([ $TSC -eq 0 ] && echo PASS || echo FAIL) biome=$([ $BIOME -eq 0 ] && echo PASS || echo FAIL)"
       [ $TSC -eq 0 ] && [ $BIOME -eq 0 ]
     depends_on: [fix-issues]
-    idle_timeout: 180000
+    # Bash nodes honor `timeout`, not `idle_timeout`.
+    timeout: 180000
 
   - id: run-tests-backend-p2
     bash: |
@@ -645,7 +757,8 @@ nodes:
       echo ""
       echo "TEST_RESULT_BACKEND=$([ $? -eq 0 ] && echo PASS || echo FAIL)"
     depends_on: [fix-issues]
-    idle_timeout: 300000
+    # Bash nodes honor `timeout`, not `idle_timeout`.
+    timeout: 300000
 
   - id: run-tests-frontend-p2
     bash: |
@@ -658,7 +771,8 @@ nodes:
       echo ""
       echo "TEST_RESULT_FRONTEND=$([ $? -eq 0 ] && echo PASS || echo FAIL)"
     depends_on: [fix-issues]
-    idle_timeout: 300000
+    # Bash nodes honor `timeout`, not `idle_timeout`.
+    timeout: 300000
 
   - id: behavioral-validation-p2
     command: dark-factory-behavioral-validation-p2
@@ -852,23 +966,20 @@ nodes:
       set -euo pipefail
       PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number")
 
-      # Capture the synthesizer outputs to disk via quoted heredocs so the
-      # JSON survives bash word-splitting / brace expansion. (Archon's
-      # variable substitution is text-based and runs before bash; using
-      # plain shell assignment with quotes results in the original quote
-      # characters being interpreted as part of the shell, which mangles
-      # the JSON. Heredoc with a quoted delimiter sidesteps that.)
+      # Capture the synthesizer outputs to disk. Archon substitutes
+      # $node-id.output before bash runs, wrapping the value in single
+      # quotes with '\'' for embedded apostrophes. Heredoc captures the
+      # raw value; Python cleans quote-wrapping and '\'' escaping so jq
+      # can parse it as valid JSON.
       cat > "$ARTIFACTS_DIR/p1-verdict.json" <<'__P1_VERDICT_EOF__'
       $synthesize-verdict-pass-1.output
       __P1_VERDICT_EOF__
       cat > "$ARTIFACTS_DIR/p2-verdict.json" <<'__P2_VERDICT_EOF__'
       $synthesize-verdict-pass-2.output
       __P2_VERDICT_EOF__
-
-      # Archon wraps substituted node outputs in single quotes for shell
-      # safety, so the captured files start with ' and end with '. Strip
-      # the wrapping quotes so jq can parse the JSON cleanly.
-      sed -i "s/^'//; s/'$//" "$ARTIFACTS_DIR/p1-verdict.json" "$ARTIFACTS_DIR/p2-verdict.json"
+      for vf in "$ARTIFACTS_DIR/p1-verdict.json" "$ARTIFACTS_DIR/p2-verdict.json"; do
+        [ -f "$vf" ] && python3 -c "import sys,pathlib;p=pathlib.Path(sys.argv[1]);t=p.read_text().strip();t=t.strip(chr(39));t=t.replace(chr(39)+chr(92)+chr(39)+chr(39),chr(39));p.write_text(t)" "$vf"
+      done
 
       # Pick the authoritative verdict. If pass-2 ran (i.e., fix happened),
       # it's authoritative. Otherwise use pass-1.
@@ -878,6 +989,25 @@ nodes:
       else
         VERDICT_FILE="$ARTIFACTS_DIR/p1-verdict.json"
         PASS_LABEL="pass-1"
+      fi
+
+      # Defensive: if the selected verdict file is empty or unparseable,
+      # an upstream node (checkout-pr, start-app, synthesize-verdict-*)
+      # failed and its output substitution resolved to nothing. The
+      # downstream jq / case logic assumes a well-formed object, so without
+      # this guard apply-verdict hits secondary parse errors and the broken
+      # run leaves the PR in a stuck state. Write a hardcoded fallback
+      # verdict that routes to the reject+escalate branch — this leaves
+      # the PR OPEN with factory:needs-human so a human can investigate
+      # the underlying validator failure.
+      if [ ! -s "$VERDICT_FILE" ] || ! jq -e '.verdict' "$VERDICT_FILE" > /dev/null 2>&1; then
+        echo "WARN: verdict file ($VERDICT_FILE) is empty or unparseable - emitting fallback reject+escalate" >&2
+        # Single-line printf (not heredoc) on purpose. Archon spawns this
+        # node via bash -c "$payload" on Windows, and multi-line heredocs
+        # with non-tabbed end markers fail to match their delimiter across
+        # that serialization boundary (discovered empirically — the P1/P2
+        # heredocs above work because their substituted bodies are one line).
+        printf '%s\n' '{"verdict":"reject","summary":"Validator infrastructure failed - no synthesizer output available. Manual investigation required.","static_checks_status":"fail","tests_status":"fail","behavioral_status":"no","security_status":"fail","issues_to_fix":[],"should_escalate":true,"escalation_reason":"Upstream node (checkout-pr, start-app, or synthesize-verdict) failed and produced no verdict. Validator cannot render a substantive decision; human must investigate the broken run.","reasoning":"Fallback verdict emitted by apply-verdict because the selected verdict file was empty or unparseable JSON. This indicates an upstream infrastructure failure, not a defect in the PR under review."}' > "$VERDICT_FILE"
       fi
 
       cp "$VERDICT_FILE" "$ARTIFACTS_DIR/verdict.json"
@@ -891,6 +1021,45 @@ nodes:
         .issues_to_fix
         | map("- **\(.severity)** [\(.category)]\(if .file then " (`\(.file)`)" else "" end): \(.description)")
         | join("\n")')
+
+      # ──────────────────────────────────────────────────────────────────
+      # DETERMINISTIC INFRASTRUCTURE BACKSTOP
+      # ──────────────────────────────────────────────────────────────────
+      # The synthesize-verdict command file has a "rule 0" that says any
+      # validation run where start-app never emitted APP_STARTED must render
+      # reject+escalate (see dark-factory-synthesize-verdict.md). That rule
+      # was empirically ignored at least once — the AI returned
+      # e2e_status: "not_e2e_testable" and verdict: "approve" while the
+      # backend had crashed at import with `RuntimeError: DATABASE_URL is
+      # not set`. An auto-merged PR that was never actually driven through
+      # agent-browser is exactly the failure mode FACTORY_RULES §4 exists
+      # to prevent, so rule-0 needs a non-AI enforcement layer.
+      #
+      # This block is that layer: deterministic bash reads start-app's
+      # output directly and flips any approve → reject+escalate when the
+      # APP_STARTED marker is absent. Keep it simple — one marker, one
+      # grep, one override. Anything more elaborate invites new bugs.
+      cat > "$ARTIFACTS_DIR/.start-app-output" <<'__START_APP_OUTPUT_EOF__'
+      $start-app.output
+      __START_APP_OUTPUT_EOF__
+      if grep -q "APP_STARTED" "$ARTIFACTS_DIR/.start-app-output"; then
+        APP_DID_START="true"
+      else
+        APP_DID_START="false"
+      fi
+      echo "INFRA_BACKSTOP: app_did_start=$APP_DID_START decision=$DECISION"
+
+      if [ "$DECISION" = "approve" ] && [ "$APP_DID_START" != "true" ]; then
+        echo "INFRA_BACKSTOP_OVERRIDE: start-app did not emit APP_STARTED but synthesizer rendered approve — overriding to reject+escalate." >&2
+        DECISION="reject"
+        SHOULD_ESCALATE="true"
+        ESCALATION_REASON="Deterministic infrastructure backstop fired: start-app output lacked the APP_STARTED marker, so no agent-browser E2E regression could have actually run against a live app. The synthesize-verdict node rendered an approve verdict anyway (rule 0 of dark-factory-synthesize-verdict.md was not honored). A human must investigate both the infrastructure failure (check \$ARTIFACTS_DIR/app-logs/backend.log and the validation.env file) and the synthesizer's failure to catch it."
+        SUMMARY="Infrastructure backstop override: start-app never reached APP_STARTED, so the agent-browser E2E regression required by FACTORY_RULES §3.3 and §4 could not have run. Auto-approve blocked."
+        ISSUES=$(printf '%s\n' \
+          "- **critical** [e2e]: start-app node did not emit APP_STARTED — backend or frontend failed to boot and the mandatory agent-browser regression never ran." \
+          "- **critical** [e2e]: synthesize-verdict rendered approve despite the missing APP_STARTED marker — review why rule 0 of the synthesize-verdict command did not fire.")
+      fi
+      # ──────────────────────────────────────────────────────────────────
 
       # GitHub forbids reviewing your own PR (addPullRequestReview GraphQL error).
       # When the bot identity authored the PR, fall back to posting a regular

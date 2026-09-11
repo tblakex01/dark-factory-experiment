@@ -1,0 +1,295 @@
+"""Tests for backend.rag.catalog — video catalog cache and prompt block builder."""
+
+from __future__ import annotations
+
+from collections.abc import Generator
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from backend.rag import catalog
+
+# ---------------------------------------------------------------------------
+# Autouse fixture: reset module-level cache between tests for isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def reset_catalog_cache() -> Generator[None, None, None]:
+    """Ensure _catalog_cache is None before and after every test."""
+    catalog._catalog_cache = None
+    yield
+    catalog._catalog_cache = None
+
+
+# ---------------------------------------------------------------------------
+# get_catalog / invalidate_catalog
+# ---------------------------------------------------------------------------
+
+
+async def test_get_catalog_populates_cache() -> None:
+    fake = [{"id": "1", "title": "T", "url": "https://youtube.com/watch?v=abc"}]
+    with patch("backend.rag.catalog.repository.list_videos", new_callable=AsyncMock) as mock_lv:
+        mock_lv.return_value = fake
+        result = await catalog.get_catalog()
+        mock_lv.assert_called_once()
+        assert result == fake
+
+
+async def test_get_catalog_uses_cache() -> None:
+    fake = [{"id": "1", "title": "T", "url": "https://youtube.com/watch?v=abc"}]
+    catalog._catalog_cache = fake
+    with patch("backend.rag.catalog.repository.list_videos", new_callable=AsyncMock) as mock_lv:
+        result = await catalog.get_catalog()
+        mock_lv.assert_not_called()
+        assert result is fake
+
+
+def test_invalidate_catalog_clears_cache() -> None:
+    catalog._catalog_cache = [{"id": "1"}]
+    catalog.invalidate_catalog()
+    assert catalog._catalog_cache is None
+
+
+# ---------------------------------------------------------------------------
+# build_catalog_block
+# ---------------------------------------------------------------------------
+
+
+def test_build_catalog_block_standard() -> None:
+    videos = [{"id": "vid-abc", "title": "My Video", "url": "https://youtube.com/watch?v=abc"}]
+    block = catalog.build_catalog_block(videos, "standard")
+    assert block["type"] == "text"
+    assert "My Video" in block["text"]
+    assert "https://youtube.com/watch?v=abc" in block["text"]
+    # The internal id is what get_video_transcript needs; it must appear in
+    # the catalog so the model can call the tool without a search round-trip.
+    assert "id=vid-abc" in block["text"]
+    assert block["cache_control"] == {"type": "ephemeral"}
+
+
+def test_build_catalog_block_extended() -> None:
+    videos = [{"id": "vid-abc", "title": "My Video", "url": "https://youtube.com/watch?v=abc"}]
+    block = catalog.build_catalog_block(videos, "extended")
+    assert block["cache_control"] == {"type": "ephemeral", "ttl": 3600}
+
+
+def test_build_catalog_block_untitled_fallback() -> None:
+    videos = [{"id": "vid-abc", "title": None, "url": "https://youtube.com/watch?v=abc"}]
+    block = catalog.build_catalog_block(videos, "standard")
+    assert "Untitled" in block["text"]
+
+
+def test_build_catalog_block_numbering() -> None:
+    videos = [
+        {"id": "1", "title": "A", "url": "u1"},
+        {"id": "2", "title": "B", "url": "u2"},
+        {"id": "3", "title": "C", "url": "u3"},
+    ]
+    block = catalog.build_catalog_block(videos, "standard")
+    assert "1. A" in block["text"]
+    assert "2. B" in block["text"]
+    assert "3. C" in block["text"]
+
+
+def test_build_catalog_block_includes_id_for_get_video_transcript() -> None:
+    """The id must appear in a copy-pasteable form so the LLM can route a
+    'lesson 1.6' style query straight to get_video_transcript without
+    issuing an extra search round (chunks aren't indexed by title or
+    curriculum identifier)."""
+    videos = [
+        {
+            "id": "33abd23a-9e63-4945-a780-95a84ba41e3a",
+            "title": "1.6 Conversational vs. Autonomous Agents",
+            "url": "",
+        },
+    ]
+    block = catalog.build_catalog_block(videos, "standard")
+    text = block["text"]
+    assert "1.6 Conversational vs. Autonomous Agents" in text
+    assert "id=33abd23a-9e63-4945-a780-95a84ba41e3a" in text
+
+
+def test_build_catalog_block_omits_url_separator_when_empty() -> None:
+    """Dynamous lessons can have empty url — don't render a dangling ' — '."""
+    videos = [{"id": "x", "title": "T", "url": ""}]
+    block = catalog.build_catalog_block(videos, "standard")
+    text = block["text"]
+    # Find the line for this video and check it doesn't end with " — "
+    line = next(line_ for line_ in text.splitlines() if line_.startswith("1. "))
+    assert not line.endswith(" — ")
+    assert "id=x" in line
+
+
+# ---------------------------------------------------------------------------
+# build_system_prompt integration
+# ---------------------------------------------------------------------------
+
+
+async def test_build_system_prompt_with_catalog() -> None:
+    from backend.llm.openrouter import build_system_prompt
+
+    fake = [{"title": "Vid", "url": "https://youtu.be/x"}]
+    with (
+        patch("backend.llm.openrouter.CATALOG_ENABLED", True),
+        patch("backend.rag.catalog.get_catalog", new_callable=AsyncMock, return_value=fake),
+    ):
+        blocks = await build_system_prompt(max_tool_calls=6)
+    assert len(blocks) == 2
+    assert "cache_control" in blocks[-1]
+    assert "cache_control" not in blocks[0]
+
+
+async def test_build_system_prompt_without_catalog() -> None:
+    from backend.llm.openrouter import build_system_prompt
+
+    with patch("backend.llm.openrouter.CATALOG_ENABLED", False):
+        blocks = await build_system_prompt(max_tool_calls=0)
+    assert len(blocks) == 1
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+
+async def test_build_system_prompt_catalog_empty_library() -> None:
+    from backend.llm.openrouter import build_system_prompt
+
+    with (
+        patch("backend.llm.openrouter.CATALOG_ENABLED", True),
+        patch("backend.rag.catalog.get_catalog", new_callable=AsyncMock, return_value=[]),
+    ):
+        blocks = await build_system_prompt(max_tool_calls=6)
+    # Empty library: no catalog block, cache anchor on base block
+    assert len(blocks) == 1
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+
+# ---------------------------------------------------------------------------
+# Membership-aware catalog filtering (issue #147)
+# ---------------------------------------------------------------------------
+
+
+async def test_build_system_prompt_catalog_excludes_dynamous_for_non_members() -> None:
+    """Non-members must not see Dynamous video titles or ids in the catalog
+    block. Without this filter, the catalog leaks the existence of every
+    paid lesson — defense-in-depth blocks transcript retrieval, but the
+    model can still surface titles/ids from the catalog in its prose."""
+    from backend.llm.openrouter import build_system_prompt
+
+    full_catalog = [
+        {
+            "id": "yt-1",
+            "title": "YouTube Vid 1",
+            "url": "https://youtu.be/x",
+            "source_type": "youtube",
+        },
+        {
+            "id": "dyn-1",
+            "title": "1.6 Conversational vs. Autonomous Agents",
+            "url": "",
+            "source_type": "dynamous",
+        },
+        {
+            "id": "yt-2",
+            "title": "YouTube Vid 2",
+            "url": "https://youtu.be/y",
+            "source_type": "youtube",
+        },
+    ]
+    with (
+        patch("backend.llm.openrouter.CATALOG_ENABLED", True),
+        patch("backend.rag.catalog.get_catalog", new_callable=AsyncMock, return_value=full_catalog),
+    ):
+        blocks = await build_system_prompt(max_tool_calls=6, is_member=False)
+    assert len(blocks) == 2
+    catalog_text = blocks[1]["text"]
+    # Dynamous title and id MUST NOT appear for non-members
+    assert "1.6 Conversational vs. Autonomous Agents" not in catalog_text
+    assert "dyn-1" not in catalog_text
+    # YouTube titles and ids ARE expected
+    assert "YouTube Vid 1" in catalog_text
+    assert "yt-1" in catalog_text
+    assert "YouTube Vid 2" in catalog_text
+
+
+async def test_build_system_prompt_catalog_includes_dynamous_for_members() -> None:
+    """Members get the full catalog including Dynamous lessons."""
+    from backend.llm.openrouter import build_system_prompt
+
+    full_catalog = [
+        {
+            "id": "yt-1",
+            "title": "YouTube Vid 1",
+            "url": "https://youtu.be/x",
+            "source_type": "youtube",
+        },
+        {
+            "id": "dyn-1",
+            "title": "1.6 Conversational vs. Autonomous Agents",
+            "url": "",
+            "source_type": "dynamous",
+        },
+    ]
+    with (
+        patch("backend.llm.openrouter.CATALOG_ENABLED", True),
+        patch("backend.rag.catalog.get_catalog", new_callable=AsyncMock, return_value=full_catalog),
+    ):
+        blocks = await build_system_prompt(max_tool_calls=6, is_member=True)
+    catalog_text = blocks[1]["text"]
+    assert "1.6 Conversational vs. Autonomous Agents" in catalog_text
+    assert "dyn-1" in catalog_text
+    assert "YouTube Vid 1" in catalog_text
+
+
+async def test_build_system_prompt_catalog_treats_missing_source_type_as_youtube() -> None:
+    """Backwards-compat: videos predating the source_type column (or with
+    NULL source_type) must be treated as YouTube — the original library."""
+    from backend.llm.openrouter import build_system_prompt
+
+    full_catalog = [
+        {"id": "old-1", "title": "Legacy Video", "url": "https://youtu.be/z"},  # no source_type key
+        {"id": "old-2", "title": "Null Source", "url": "https://youtu.be/q", "source_type": None},
+    ]
+    with (
+        patch("backend.llm.openrouter.CATALOG_ENABLED", True),
+        patch("backend.rag.catalog.get_catalog", new_callable=AsyncMock, return_value=full_catalog),
+    ):
+        blocks = await build_system_prompt(max_tool_calls=6, is_member=False)
+    catalog_text = blocks[1]["text"]
+    assert "Legacy Video" in catalog_text
+    assert "Null Source" in catalog_text
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: CATALOG_TIER wiring, missing url, DB failure
+# ---------------------------------------------------------------------------
+
+
+def test_build_catalog_block_extended_ttl_is_integer() -> None:
+    """CATALOG_TIER='extended' must produce an integer ttl, not a string."""
+    with patch("backend.rag.catalog.CATALOG_CACHE_TTL_SECONDS", 3600):
+        videos = [{"id": "v", "title": "Vid", "url": "https://youtu.be/x"}]
+        block = catalog.build_catalog_block(videos, "extended")
+    assert isinstance(block["cache_control"]["ttl"], int)
+    assert block["cache_control"]["ttl"] == 3600
+
+
+def test_build_catalog_block_missing_url() -> None:
+    """Video dict without 'url' key must not raise a KeyError."""
+    videos = [{"id": "v", "title": "My Video"}]
+    block = catalog.build_catalog_block(videos, "standard")
+    assert "My Video" in block["text"]
+    # url defaults to empty string — no crash
+    assert block["type"] == "text"
+
+
+async def test_get_catalog_returns_empty_list_on_db_error() -> None:
+    """DB failure in list_videos must return [] and not raise, preventing retry storm."""
+    catalog._catalog_cache = None
+    with patch(
+        "backend.rag.catalog.repository.list_videos",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("DB unavailable"),
+    ):
+        result = await catalog.get_catalog()
+    assert result == []
+    # Cache is set to [] so the next call skips the DB entirely
+    assert catalog._catalog_cache == []

@@ -1,6 +1,8 @@
-import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { type MutableRefObject, type RefObject, useEffect, useRef, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../hooks/useAuth';
 import { useConversations } from '../hooks/useConversations';
+import { useToast } from '../hooks/useToast';
 import { type Conversation, createConversation, deleteConversation } from '../lib/api';
 import { VideoExplorer } from './VideoExplorer';
 
@@ -32,16 +34,56 @@ function SkeletonRow() {
   );
 }
 
+// ── Highlight matched substring in a title ──────────────────────
+function highlightMatch(title: string, query: string) {
+  const q = query.trim();
+  if (!q) return title;
+  const idx = title.toLowerCase().indexOf(q.toLowerCase());
+  if (idx === -1) return title;
+  return (
+    <>
+      {title.slice(0, idx)}
+      <mark
+        style={{
+          background: 'rgba(59,130,246,0.35)',
+          color: 'inherit',
+          padding: 0,
+          borderRadius: 2,
+        }}
+      >
+        {title.slice(idx, idx + q.length)}
+      </mark>
+      {title.slice(idx + q.length)}
+    </>
+  );
+}
+
 // ── Single conversation item ─────────────────────────────────────
 interface ConvItemProps {
   conv: Conversation;
   isActive: boolean;
+  searchQuery: string;
   onSelect: () => void;
   onDeleteRequest: (id: string) => void;
+  onRename: (id: string, title: string) => void;
 }
 
-function ConvItem({ conv, isActive, onSelect, onDeleteRequest }: ConvItemProps) {
+function ConvItem({
+  conv,
+  isActive,
+  searchQuery,
+  onSelect,
+  onDeleteRequest,
+  onRename,
+}: ConvItemProps) {
   const [hovered, setHovered] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editValue, setEditValue] = useState(conv.title);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) inputRef.current?.focus();
+  }, [editing]);
 
   const preview = conv.preview
     ? conv.preview.length > 80
@@ -49,14 +91,31 @@ function ConvItem({ conv, isActive, onSelect, onDeleteRequest }: ConvItemProps) 
       : conv.preview
     : null;
 
+  const handleRenameCommit = () => {
+    const trimmed = editValue.trim();
+    if (trimmed && trimmed !== conv.title) {
+      onRename(conv.id, trimmed);
+    }
+    setEditing(false);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') handleRenameCommit();
+    if (e.key === 'Escape') {
+      setEditing(false);
+      setEditValue(conv.title);
+    }
+  };
+
   return (
     <div
       role="button"
       tabIndex={0}
       onClick={onSelect}
-      onKeyDown={(e) => e.key === 'Enter' && onSelect()}
+      onKeyDown={(e) => e.key === 'Enter' && !editing && onSelect()}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
+      className="focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
       style={{
         position: 'relative',
         padding: '10px 16px',
@@ -65,24 +124,51 @@ function ConvItem({ conv, isActive, onSelect, onDeleteRequest }: ConvItemProps) 
         background: isActive ? '#1e293b' : hovered ? 'rgba(30,41,59,0.6)' : 'transparent',
         borderLeft: isActive ? '3px solid #3b82f6' : '3px solid transparent',
         paddingLeft: 13,
-        transition: 'background 0.15s',
+        transition: 'background 0.15s, border-color 0.15s',
         userSelect: 'none',
       }}
     >
       {/* Title */}
-      <div
-        style={{
-          fontSize: 14,
-          fontWeight: 500,
-          color: '#f1f5f9',
-          whiteSpace: 'nowrap',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          paddingRight: hovered ? 28 : 0,
-        }}
-      >
-        {conv.title}
-      </div>
+      {editing ? (
+        <input
+          ref={inputRef}
+          value={editValue}
+          onChange={(e) => setEditValue(e.target.value)}
+          onKeyDown={handleKeyDown}
+          onBlur={handleRenameCommit}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            fontSize: 14,
+            fontWeight: 500,
+            color: '#f1f5f9',
+            background: '#0f172a',
+            border: '1px solid #3b82f6',
+            borderRadius: 4,
+            padding: '1px 6px',
+            width: '100%',
+            outline: 'none',
+          }}
+        />
+      ) : (
+        <div
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            setEditing(true);
+            setEditValue(conv.title);
+          }}
+          style={{
+            fontSize: 14,
+            fontWeight: 500,
+            color: '#f1f5f9',
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            paddingRight: hovered ? 56 : 0,
+          }}
+        >
+          {highlightMatch(conv.title, searchQuery)}
+        </div>
+      )}
 
       {/* Timestamp */}
       <div
@@ -111,14 +197,49 @@ function ConvItem({ conv, isActive, onSelect, onDeleteRequest }: ConvItemProps) 
         </div>
       )}
 
+      {/* Pencil icon — visible on hover (rename) */}
+      {hovered && !editing && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            setEditing(true);
+            setEditValue(conv.title);
+          }}
+          aria-label="Rename conversation"
+          title="Rename conversation"
+          className="focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
+          style={{
+            position: 'absolute',
+            right: 30,
+            top: '50%',
+            transform: 'translateY(-50%)',
+            background: 'transparent',
+            border: 'none',
+            cursor: 'pointer',
+            color: '#475569',
+            padding: 4,
+            borderRadius: 4,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            transition: 'color 0.15s',
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.color = '#3b82f6')}
+          onMouseLeave={(e) => (e.currentTarget.style.color = '#475569')}
+        >
+          ✏️
+        </button>
+      )}
+
       {/* Delete button — visible on hover */}
-      {hovered && (
+      {hovered && !editing && (
         <button
           onClick={(e) => {
             e.stopPropagation();
             onDeleteRequest(conv.id);
           }}
           title="Delete conversation"
+          className="focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
           style={{
             position: 'absolute',
             right: 10,
@@ -186,6 +307,7 @@ function ConfirmDialog({ onConfirm, onCancel, deleting, error }: ConfirmDialogPr
           padding: 24,
           width: 320,
           maxWidth: 'calc(100vw - 48px)',
+          boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)',
         }}
       >
         <p style={{ margin: '0 0 8px', fontWeight: 600, color: '#f1f5f9' }}>Delete conversation?</p>
@@ -200,6 +322,7 @@ function ConfirmDialog({ onConfirm, onCancel, deleting, error }: ConfirmDialogPr
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
           <button
             onClick={onCancel}
+            className="focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
             style={{
               background: 'transparent',
               border: '1px solid rgba(255,255,255,0.15)',
@@ -215,6 +338,7 @@ function ConfirmDialog({ onConfirm, onCancel, deleting, error }: ConfirmDialogPr
           <button
             onClick={onConfirm}
             disabled={deleting}
+            className="focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
             style={{
               background: '#ef4444',
               border: 'none',
@@ -234,25 +358,97 @@ function ConfirmDialog({ onConfirm, onCancel, deleting, error }: ConfirmDialogPr
   );
 }
 
+// ── Daily quota counter ──────────────────────────────────────────
+interface DailyQuotaCounterProps {
+  used: number;
+  remaining: number;
+  resetsAt: string | null;
+}
+
+function DailyQuotaCounter({ used, remaining, resetsAt }: DailyQuotaCounterProps) {
+  const cap = used + remaining;
+  const atLimit = remaining === 0;
+  const resetLabel = resetsAt
+    ? new Date(resetsAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : null;
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      data-testid="quota-counter"
+      style={{
+        padding: '8px 12px',
+        borderTop: '1px solid rgba(255,255,255,0.06)',
+        fontSize: 12,
+        color: atLimit ? '#ef4444' : '#94a3b8',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        gap: 8,
+      }}
+    >
+      <span>
+        <strong style={{ color: atLimit ? '#ef4444' : '#f1f5f9', fontWeight: 600 }}>
+          {used}/{cap}
+        </strong>{' '}
+        messages today
+      </span>
+      {atLimit && resetLabel && (
+        <span style={{ fontSize: 11, opacity: 0.85 }}>resets at {resetLabel}</span>
+      )}
+    </div>
+  );
+}
+
 // ── Main Sidebar component ───────────────────────────────────────
 interface SidebarProps {
   activeConversationId?: string;
   isOpen: boolean;
   onClose: () => void;
+  conversationsRef?: MutableRefObject<(() => Promise<void>) | null>;
 }
 
-export function Sidebar({ activeConversationId, isOpen, onClose }: SidebarProps) {
+export function Sidebar({ activeConversationId, isOpen, onClose, conversationsRef }: SidebarProps) {
   const navigate = useNavigate();
-  const { conversations, loading, refetch } = useConversations();
+  const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const { conversations, loading, refetch, rename, filteredConversations } =
+    useConversations(debouncedQuery);
+  const { user, logout } = useAuth();
   const [creatingNew, setCreatingNew] = useState(false);
   const [newChatError, setNewChatError] = useState<string | null>(null);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const { addToast } = useToast();
+
+  // Debounce search query — 250ms per issue #92
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(searchQuery), 250);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  // Store refetch in the shared ref so ChatArea can trigger it
+  useEffect(() => {
+    if (conversationsRef) {
+      conversationsRef.current = refetch;
+    }
+  }, [refetch, conversationsRef]);
 
   // ── New Chat ──
   const handleNewChat = async () => {
+    // Guard: if already on an empty conversation, reuse it instead of creating a duplicate
+    if (activeConversationId) {
+      const activeConv = conversations.find((c) => c.id === activeConversationId);
+      if (activeConv && !activeConv.preview) {
+        // Already on an empty conversation — no-op, just close sidebar
+        onClose();
+        return;
+      }
+    }
     setCreatingNew(true);
     setNewChatError(null);
     try {
@@ -287,7 +483,8 @@ export function Sidebar({ activeConversationId, isOpen, onClose }: SidebarProps)
       if (activeConversationId === confirmId) {
         navigate('/');
       }
-    } catch {
+    } catch (e) {
+      console.error('[Sidebar] Delete conversation failed:', e);
       setDeleteError(true);
     } finally {
       setDeleting(false);
@@ -305,6 +502,26 @@ export function Sidebar({ activeConversationId, isOpen, onClose }: SidebarProps)
     onClose();
   };
 
+  // ── Logout ──
+  const handleLogout = async () => {
+    setLoggingOut(true);
+    try {
+      await logout();
+      onClose();
+      navigate('/login');
+    } finally {
+      setLoggingOut(false);
+    }
+  };
+
+  // ── Rename ──
+  const handleRename = async (id: string, title: string) => {
+    const { ok, error } = await rename(id, title);
+    if (!ok && error) {
+      addToast(`Rename failed: ${error}`, 'error');
+    }
+  };
+
   return (
     <>
       <aside className={`sidebar-container${isOpen ? ' open' : ''}`}>
@@ -313,6 +530,7 @@ export function Sidebar({ activeConversationId, isOpen, onClose }: SidebarProps)
           <button
             onClick={handleNewChat}
             disabled={creatingNew}
+            className="active:brightness-90 focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none focus-visible:shadow-[0_0_12px_var(--accent-glow)]"
             style={{
               width: '100%',
               background: '#3b82f6',
@@ -328,10 +546,14 @@ export function Sidebar({ activeConversationId, isOpen, onClose }: SidebarProps)
               alignItems: 'center',
               justifyContent: 'center',
               gap: 8,
-              transition: 'background 0.15s',
+              transition: 'background 0.15s, filter 0.15s',
             }}
             onMouseEnter={(e) => !creatingNew && (e.currentTarget.style.background = '#1d4ed8')}
-            onMouseLeave={(e) => !creatingNew && (e.currentTarget.style.background = '#3b82f6')}
+            onMouseLeave={(e) => {
+              if (!creatingNew) {
+                e.currentTarget.style.background = '#3b82f6';
+              }
+            }}
           >
             <svg
               width="14"
@@ -355,6 +577,30 @@ export function Sidebar({ activeConversationId, isOpen, onClose }: SidebarProps)
           )}
         </div>
 
+        {/* ── Search conversations ── */}
+        <div style={{ padding: '0 12px 8px' }}>
+          <input
+            type="text"
+            placeholder="Search conversations..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
+            style={{
+              width: '100%',
+              padding: '8px 12px',
+              borderRadius: 8,
+              background: '#1e293b',
+              border: '1px solid #334155',
+              color: '#f1f5f9',
+              fontSize: 13,
+              outline: 'none',
+              transition: 'border-color 0.15s',
+            }}
+            onFocus={(e) => (e.currentTarget.style.borderColor = '#3b82f6')}
+            onBlur={(e) => (e.currentTarget.style.borderColor = '#334155')}
+          />
+        </div>
+
         {/* ── Conversation list ── */}
         <div style={{ flex: 1, overflowY: 'auto' }}>
           {loading ? (
@@ -364,8 +610,8 @@ export function Sidebar({ activeConversationId, isOpen, onClose }: SidebarProps)
               <SkeletonRow />
               <SkeletonRow />
             </>
-          ) : conversations.length === 0 ? (
-            // Empty state
+          ) : filteredConversations.length === 0 ? (
+            // Empty state — distinct copy when the user is searching
             <div
               style={{
                 padding: '40px 16px',
@@ -384,38 +630,123 @@ export function Sidebar({ activeConversationId, isOpen, onClose }: SidebarProps)
               >
                 <path d="M6,4 L30,4 A2,2 0 0,1 32,6 L32,24 A2,2 0 0,1 30,26 L10,26 L4,32 L4,6 A2,2 0 0,1 6,4 Z" />
               </svg>
-              <p style={{ margin: 0, fontSize: 13 }}>No conversations yet</p>
-              <button
-                onClick={handleNewChat}
-                style={{
-                  marginTop: 10,
-                  background: 'transparent',
-                  border: '1px solid rgba(59,130,246,0.4)',
-                  borderRadius: 8,
-                  color: '#3b82f6',
-                  cursor: 'pointer',
-                  fontSize: 13,
-                  padding: '7px 16px',
-                  transition: 'background 0.15s',
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = 'rgba(59,130,246,0.1)')}
-                onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-              >
-                Start your first chat →
-              </button>
+              {debouncedQuery.trim() ? (
+                <p style={{ margin: 0, fontSize: 13 }}>
+                  No matches for <strong style={{ color: '#94a3b8' }}>"{debouncedQuery}"</strong>
+                </p>
+              ) : (
+                <>
+                  <p style={{ margin: 0, fontSize: 13 }}>No conversations yet</p>
+                  <button
+                    onClick={handleNewChat}
+                    className="active:brightness-90 focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
+                    style={{
+                      marginTop: 10,
+                      background: 'transparent',
+                      border: '1px solid rgba(59,130,246,0.4)',
+                      borderRadius: 8,
+                      color: '#3b82f6',
+                      cursor: 'pointer',
+                      fontSize: 13,
+                      padding: '7px 16px',
+                      transition: 'background 0.15s, filter 0.15s',
+                    }}
+                    onMouseEnter={(e) =>
+                      (e.currentTarget.style.background = 'rgba(59,130,246,0.1)')
+                    }
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = 'transparent';
+                    }}
+                  >
+                    Start your first chat →
+                  </button>
+                </>
+              )}
             </div>
           ) : (
-            conversations.map((conv) => (
+            filteredConversations.map((conv) => (
               <ConvItem
                 key={conv.id}
                 conv={conv}
                 isActive={conv.id === activeConversationId}
+                searchQuery={debouncedQuery}
                 onSelect={() => handleSelect(conv.id)}
                 onDeleteRequest={handleDeleteRequest}
+                onRename={handleRename}
               />
             ))
           )}
         </div>
+
+        {/* ── Daily message quota counter (MISSION §10 #1: hardcoded 25/24h) ── */}
+        {user && (
+          <DailyQuotaCounter
+            used={user.messages_used_today}
+            remaining={user.messages_remaining_today}
+            resetsAt={user.rate_window_resets_at}
+          />
+        )}
+
+        {/* ── User identity + logout row ── */}
+        {user && (
+          <div
+            style={{
+              padding: '8px 12px',
+              borderTop: '1px solid rgba(255,255,255,0.06)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 8,
+            }}
+          >
+            <span
+              title={user.email}
+              style={{
+                fontSize: 12,
+                color: '#94a3b8',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                flex: 1,
+                minWidth: 0,
+              }}
+            >
+              {user.email}
+            </span>
+            <button
+              onClick={handleLogout}
+              disabled={loggingOut}
+              title="Log out"
+              aria-label="Log out"
+              className="focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
+              style={{
+                background: 'transparent',
+                border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: 7,
+                color: '#94a3b8',
+                cursor: loggingOut ? 'not-allowed' : 'pointer',
+                padding: '5px 10px',
+                fontSize: 12,
+                opacity: loggingOut ? 0.6 : 1,
+                transition: 'background 0.15s, color 0.15s, border-color 0.15s',
+                flexShrink: 0,
+              }}
+              onMouseEnter={(e) => {
+                if (loggingOut) return;
+                e.currentTarget.style.background = '#1e293b';
+                e.currentTarget.style.color = '#f1f5f9';
+                e.currentTarget.style.borderColor = 'rgba(239,68,68,0.4)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = 'transparent';
+                e.currentTarget.style.color = '#94a3b8';
+                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)';
+              }}
+            >
+              {loggingOut ? 'Signing out…' : 'Log out'}
+            </button>
+          </div>
+        )}
 
         {/* ── Sidebar footer: branding + library button ── */}
         <div
@@ -425,15 +756,48 @@ export function Sidebar({ activeConversationId, isOpen, onClose }: SidebarProps)
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
+            gap: 8,
           }}
         >
-          <span style={{ fontSize: 12, color: '#475569' }}>RAG YouTube Chat</span>
+          <span style={{ fontSize: 12, color: '#475569' }}>DynaChat</span>
+
+          {/* Library admin link — admin-only. is_admin is a server-computed
+              hint only; the /api/admin/* endpoints re-verify on every call. */}
+          {user?.is_admin && (
+            <Link
+              to="/admin"
+              title="Manage video library"
+              className="focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
+              style={{
+                fontSize: 12,
+                color: '#94a3b8',
+                border: '1px solid rgba(255,255,255,0.08)',
+                borderRadius: 7,
+                padding: '5px 7px',
+                textDecoration: 'none',
+                transition: 'background 0.15s, color 0.15s, border-color 0.15s',
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = '#1e293b';
+                e.currentTarget.style.color = '#f1f5f9';
+                e.currentTarget.style.borderColor = 'rgba(59,130,246,0.4)';
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = 'transparent';
+                e.currentTarget.style.color = '#94a3b8';
+                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)';
+              }}
+            >
+              Admin
+            </Link>
+          )}
 
           {/* Library / VideoExplorer button */}
           <button
             onClick={() => setExplorerOpen(true)}
             title="Browse video library"
             aria-label="Browse video library"
+            className="focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:outline-none"
             style={{
               background: 'transparent',
               border: '1px solid rgba(255,255,255,0.08)',

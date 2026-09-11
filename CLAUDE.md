@@ -103,7 +103,7 @@ Chunking uses Docling `HybridChunker` with a tiktoken `cl100k_base` `OpenAIToken
 ### SSE wire format (frontend parser depends on this exactly)
 
 - Token: `data: <JSON-encoded string>\n\n` — tokens are JSON strings (quoted, escaped) so newlines survive
-- Sources: `event: sources\ndata: <JSON array>\n\n`, emitted **before** the terminator
+- Sources: `event: sources\ndata: <JSON array>\n\n`, emitted **before** the terminator only when retrieval produced at least one source; omitted entirely when retrieval returns no chunks or fails
 - Terminator: `data: [DONE]\n\n`
 - Mid-stream error: `data: {"error": "..."}\n\n`
 
@@ -121,7 +121,7 @@ SQLite via `aiosqlite`, no ORM, no migrations. `db/schema.py` runs `CREATE TABLE
 
 ### Other endpoints
 
-`GET /api/health` (counts + db path), `GET /api/version` (package metadata; 503 if unavailable), `POST /api/stream-test` (streams a canned LLM reply to smoke-test SSE), `GET /api/videos`, `GET/POST/DELETE /api/conversations[/{id}]`.
+`GET /api/health` (counts + db path), `GET /api/version` (package metadata; 503 if unavailable), `POST /api/stream-test` (live-provider streaming smoke test; needs a working OpenRouter key), `GET /api/videos`, `GET/POST/DELETE /api/conversations[/{id}]`.
 
 ---
 

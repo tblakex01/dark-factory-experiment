@@ -1,328 +1,215 @@
 # CLAUDE.md
 
-Instructions for AI coding agents working in this repository. Read this before making any code changes.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-This file covers **how the code is written**. For *what* to build, see `MISSION.md`. For *how the factory operates*, see `FACTORY_RULES.md`. When this file and those conflict, MISSION.md wins on scope, FACTORY_RULES.md wins on process, and CLAUDE.md wins on code style.
-
----
-
-## Project Overview
-
-**DynaChat** is a RAG-powered chat interface that lets viewers query a single YouTube channel's content and get streaming answers with per-chunk citations that deep-link to the exact timestamp in the source video. FastAPI + Python backend, React + Vite + TypeScript frontend, SQLite (migrating to Postgres eventually).
+This file covers **how the code is written**. For *what* to build, see `MISSION.md`. For *how the factory operates*, see `FACTORY_RULES.md`. When these conflict: MISSION.md wins on scope, FACTORY_RULES.md wins on process, CLAUDE.md wins on code style. All three are protected files (FACTORY_RULES.md §5) — factory workflows must never modify them; only a human commit may.
 
 ---
 
-## Tech Stack
+## What This Repo Is
 
-**Backend**
-- Python 3.11+ (not specified in any lockfile; don't rely on 3.12+ features)
-- `uv` for package management (not pip, not poetry) — `backend/pyproject.toml` is the dependency source of truth, `backend/uv.lock` pins exact versions
-- FastAPI with `uvicorn[standard]` ASGI server
-- `aiosqlite` for async SQLite access (no ORM — raw SQL through `db/repository.py`)
-- `docling-core[chunking]` for transcript chunking (HybridChunker)
-- `openai` SDK pointed at OpenRouter's OpenAI-compatible endpoint (for both embeddings and chat completions)
-- `numpy` for in-process cosine similarity
-- `python-dotenv` for config loading
+Two things live here:
 
-**Frontend**
-- Bun (not npm, not pnpm — use `bun install`, `bun run dev`, `bun run build`)
-- React 18.3, TypeScript 5.4, Vite 5.2
-- `react-router-dom` v6 for routing
-- `react-markdown` + `remark-gfm` for assistant message rendering
-- `react-syntax-highlighter` for code blocks
-- Tailwind CSS 3.4 (no component library — components are built from Tailwind primitives)
-- Vanilla `fetch()` for API calls (no axios, no SDK) — typed wrappers in `src/lib/api.ts`
+1. **DynaChat** (`app/`) — a RAG chat app over a single YouTube channel's transcripts. FastAPI + Python backend, React + Vite + TypeScript frontend, SQLite (Postgres migration planned). Streaming answers with citations.
+2. **The Dark Factory** (`.archon/`, `contracts/`, `feedback/`, `progress.json`) — Archon workflows that triage GitHub issues, implement fixes in isolated worktrees, validate PRs, and auto-merge. `.archon/commands/*.md` are the agent prompts; `.archon/workflows/*.yaml` wire them together. `contracts/` and `feedback/` are sprint-planning artifacts from the initial build, not runtime code.
+
+Most tasks touch only `app/`. Read `MISSION.md` and `FACTORY_RULES.md` before any non-trivial change.
 
 ---
 
-## Repo Layout
+## Commands
 
-```
-rag-youtube-chat/
-├── MISSION.md               # Product scope — factory reads this at triage
-├── FACTORY_RULES.md         # Factory operational rules — every workflow reads this
-├── CLAUDE.md                # This file — code conventions
-├── README.md                # Human-facing quick start
-├── spec.md                  # Product/design spec (reference, not governance)
-├── app/
-│   ├── start.sh             # POSIX bootstrap: venv → pip install → uvicorn + bun dev
-│   ├── start.bat            # Windows equivalent
-│   ├── backend/
-│   │   ├── main.py          # FastAPI app factory, lifespan init, /api/health
-│   │   ├── config.py        # All env var reads + hardcoded constants
-│   │   ├── pyproject.toml   # uv dependencies + tool config (ruff, mypy, pytest)
-│   │   ├── uv.lock          # uv lockfile (committed, pinned versions)
-│   │   ├── data/
-│   │   │   ├── chat.db      # SQLite database (auto-created, gitignored)
-│   │   │   └── seed.py      # 10 mock videos seeded on first startup
-│   │   ├── db/
-│   │   │   ├── schema.py    # CREATE TABLE IF NOT EXISTS, PRAGMAs, init_db()
-│   │   │   └── repository.py # ALL raw SQL lives here — nowhere else
-│   │   ├── llm/
-│   │   │   └── openrouter.py # stream_chat() async generator, SSE-formatted output
-│   │   ├── rag/
-│   │   │   ├── chunker.py    # Docling HybridChunker wrapper
-│   │   │   ├── embeddings.py # embed_text / embed_batch via OpenRouter
-│   │   │   └── retriever.py  # NumPy cosine similarity top-k
-│   │   └── routes/
-│   │       ├── conversations.py # GET/POST/DELETE /api/conversations*, GET /api/videos
-│   │       ├── messages.py      # POST /api/conversations/{id}/messages (streaming SSE)
-│   │       └── ingest.py        # POST /api/ingest
-│   └── frontend/
-│       ├── package.json      # Bun dependencies + scripts
-│       ├── vite.config.ts    # Dev server port, API proxy to backend
-│       ├── tsconfig.json
-│       ├── index.html
-│       └── src/
-│           ├── main.tsx      # React root
-│           ├── App.tsx       # BrowserRouter + layout
-│           ├── components/   # ChatArea, Sidebar, Message, MarkdownRenderer, ChatInput, VideoExplorer, ToastProvider
-│           ├── hooks/        # useConversations, useMessages, useStreamingResponse, useToast
-│           ├── lib/
-│           │   └── api.ts    # All typed fetch wrappers + TypeScript interfaces
-│           └── styles/
-│               └── globals.css # Tailwind imports
-└── .archon/
-    └── config.yaml           # Per-codebase Archon env (GITIGNORED — holds MiniMax auth token)
+### Backend (run from `app/backend/` unless noted)
+
+```bash
+cd app/backend
+uv sync --all-extras                 # creates .venv, installs runtime + dev deps (ruff, mypy, pytest)
+
+uv run ruff check .                  # lint
+uv run ruff check --fix .            # lint autofix
+uv run ruff format --check .         # format check (use `uv run ruff format .` to apply)
+uv run mypy .                        # type check
+uv run pytest tests -xvs             # all tests
+uv run pytest tests/test_version.py -xvs                                   # one file
+uv run pytest tests/test_version.py::test_version_endpoint_returns_200 -xvs  # one test
 ```
 
-**Placement rules** (where new files go):
-
-- New API routes → new file in `app/backend/routes/`, one file per resource. Mount from `main.py`.
-- New SQL queries → `app/backend/db/repository.py` only. Never write SQL in route handlers, services, or components.
-- New schema changes → `app/backend/db/schema.py`. For the current SQLite phase, use `CREATE TABLE IF NOT EXISTS` with portable SQL. See "Database" section for the Postgres-portability rules you must follow *now*.
-- New RAG pipeline steps → `app/backend/rag/`. Keep chunker, embeddings, and retriever as separate modules.
-- New React components → `app/frontend/src/components/`, one component per file, named exports matching filename.
-- New React hooks → `app/frontend/src/hooks/`, prefix with `use`.
-- New API client functions → `app/frontend/src/lib/api.ts`. Keep all fetch calls in this one file.
-
----
-
-## Running the App
-
-Install and start everything (backend venv + deps, frontend deps, both dev servers):
+Run the dev server from `app/` (not `app/backend/`) — the `backend.main:app` import path requires it:
 
 ```bash
 cd app
-./start.sh         # POSIX
-start.bat          # Windows
-```
-
-Manual backend:
-
-```bash
-cd app/backend
-uv sync --all-extras                   # creates backend/.venv, installs runtime + dev deps
-cd ..
 uv --project backend run uvicorn backend.main:app --reload --port 8000
 ```
 
-Backend **must** be run from `app/` (not `app/backend/`) — the `backend.main:app` import path requires it. Running from the wrong cwd gives `ModuleNotFoundError: No module named 'backend'`. The `--project backend` flag tells uv to use `app/backend/.venv` while cwd is `app/`.
+Tooling (ruff/mypy/pytest) must run from `app/backend/` so `pyproject.toml` config is picked up. Running them from `app/` with `--project backend` silently loses the exclude lists and `asyncio_mode = "auto"`.
 
-Manual frontend:
+### Frontend (run from `app/frontend/`)
 
 ```bash
 cd app/frontend
-bun install
-bun run dev           # dev server with HMR
-bun run build         # production build → dist/
-bun run preview       # serve built assets
+bun install                          # bun only — not npm/pnpm/yarn
+bun run dev                          # Vite dev server on :5173, proxies /api → :8000
+bun run build                        # tsc && vite build → dist/
+bun run tsc --noEmit                 # type check (also: bun run type-check)
+bun x biome check src                # lint + format check (bun run lint)
+bun x biome check --apply src        # autofix
+bun run test                         # vitest run (all)
+bun x vitest run src/components/Foo.test.tsx   # one file
+bun x vitest run -t "renders sources"          # one test by name
 ```
+
+**Gotcha:** `bun run test` exits 1 with "No test files found" while there are zero frontend test files. Vitest, jsdom, and Testing Library are already installed and configured (`vitest.config.ts`, `src/__tests__/setup.ts`); the first PR that adds a `*.test.tsx` makes this pass.
+
+### Everything at once
+
+```bash
+cd app && ./start.sh      # uv sync → seed DB → uvicorn :8000 + vite :5173 (start.bat on Windows)
+```
+
+`start.sh` copies a repo-root `.env` into `app/.env` if present. The README's "Manual start" section (python -m venv / pip / requirements.txt) is stale — use the uv commands above.
+
+### What the validator runs before merge
+
+```bash
+cd app/backend && uv run ruff check . && uv run ruff format --check . && uv run mypy . && uv run pytest tests -xvs
+cd app/frontend && bun run tsc --noEmit && bun x biome check src && bun run test
+```
+
+Plus the agent-browser end-to-end regression (FACTORY_RULES.md §4, skill at `.claude/skills/agent-browser/SKILL.md`). Run all of it before declaring a PR done.
 
 ---
 
-## Testing
+## Architecture
 
-**Current state: no tests exist yet.** When you add them, use the tools below. The factory's agent-browser regression test (see FACTORY_RULES.md §4) is a separate end-to-end gate and does not replace unit/integration tests.
+### Request flow for a chat message
 
-**Python backend:**
+`POST /api/conversations/{id}/messages` in `routes/messages.py` orchestrates the whole RAG pipeline in one handler:
 
-```bash
-cd app/backend
-uv run pytest tests -xvs
-```
+1. Persist the user message (`db/repository.py`)
+2. Load full conversation history for the LLM
+3. `rag/embeddings.embed_text()` embeds the query via OpenRouter
+4. `rag/retriever.retrieve()` loads **every** chunk embedding from SQLite into NumPy and returns the top-5 by cosine similarity, joined with video titles
+5. `llm/openrouter.stream_chat()` streams `anthropic/claude-sonnet-4.6` with the chunks injected into the system prompt
+6. The route intercepts `data: [DONE]` to emit the `sources` event first, then persists the assistant text (reconstructed from the SSE chunks) and auto-titles the conversation on first reply
 
-All backend tool invocations run from `app/backend/` so that `pyproject.toml` (which holds ruff, mypy, pytest config) is picked up. Running the tools from `app/` with `--project backend` works for package resolution but mypy/pytest **do not** auto-discover config from a non-cwd project, so you'd silently lose the exclude lists and asyncio mode.
+Retrieval failures are swallowed (logged, answer continues without context). LLM errors before the first token raise; after the first token they arrive as a `data: {"error": ...}` SSE payload.
 
-- Test directory: `app/backend/tests/` (already exists with skeleton `__init__.py` + `conftest.py`)
-- `pytest`, `pytest-asyncio`, and `httpx` are declared in `backend/pyproject.toml` under `[project.optional-dependencies].dev` — installed by `uv sync --all-extras`
-- Use `pytest-asyncio` for async tests (`asyncio_mode = "auto"` is set in `pyproject.toml`, so plain `async def` test functions work)
-- Use `httpx.AsyncClient` against a test FastAPI app for integration tests
-- SQLite tests use a separate temp database; never touch `app/backend/data/chat.db`
+### Ingest and seeding
 
-**TypeScript frontend:**
+`POST /api/ingest` and `data/seed.py` share the same pipeline: create video row → `rag/chunker.chunk_video()` → `rag/embeddings.embed_batch()` → one `chunks` row per chunk with the embedding stored as a JSON-encoded float array in a TEXT column. Seeding runs in the FastAPI lifespan on every startup: full seed if no videos, chunk-and-embed if videos exist without chunks, skip otherwise. Because seeding calls the embeddings API, starting without `OPENROUTER_API_KEY` yields 10 videos and 0 chunks; the next startup with a key backfills the chunks.
 
-```bash
-cd app/frontend
-bun add -D vitest @testing-library/react @testing-library/jest-dom jsdom
-bun run test
-```
+Chunking uses Docling `HybridChunker` with a tiktoken `cl100k_base` `OpenAITokenizer` (matching `text-embedding-3-small`), `max_tokens=512`, plus a post-pass that hard-splits any chunk over 2400 chars and guarantees ≥2 chunks for ≥3-paragraph transcripts.
 
-- Test directory: `app/frontend/src/__tests__/` or co-located `*.test.tsx` files
-- Use Vitest (not Jest — Vite-native, faster)
-- Mock `fetch` with `vi.stubGlobal('fetch', ...)` for hook tests
+### SSE wire format (frontend parser depends on this exactly)
+
+- Token: `data: <JSON-encoded string>\n\n` — tokens are JSON strings (quoted, escaped) so newlines survive
+- Sources: `event: sources\ndata: <JSON array>\n\n`, emitted **before** the terminator
+- Terminator: `data: [DONE]\n\n`
+- Mid-stream error: `data: {"error": "..."}\n\n`
+
+`useStreamingResponse.ts` is the only SSE consumer and the one sanctioned inline `fetch()` outside `lib/api.ts`. Do not parse SSE anywhere else. Change both sides together or not at all.
+
+**Current gap vs. MISSION.md:** the `sources` array is currently a list of video-title strings. MISSION.md's quality bar (and the §4 regression test) require citations with title, URL, timestamp deep-link, and transcript snippet, plus a modal with an embedded player at the timestamp. Likewise auth and the 25 msg/day rate limit are in MISSION.md but not implemented. Build toward these when an issue is filed; never regress a field once it exists.
+
+### Frontend shape
+
+`App.tsx` holds `BrowserRouter` with `/` and `/c/:conversationId` rendering the same `AppLayout` (Sidebar + ChatArea). State is plain hooks: `useConversations`, `useMessages`, `useStreamingResponse`, `useToast` (Context via `ToastProvider`). `lib/api.ts` holds every typed fetch wrapper and the shared interfaces (`Video`, `Conversation`, `Message`).
+
+### Database
+
+SQLite via `aiosqlite`, no ORM, no migrations. `db/schema.py` runs `CREATE TABLE IF NOT EXISTS` for `videos`, `chunks` (FK → videos, cascade), `conversations`, `messages` (FK → conversations, cascade, `role` CHECK) with `PRAGMA foreign_keys=ON` and `journal_mode=WAL`. Every query lives in `db/repository.py`; each function opens its own connection. IDs are text UUIDs; `repository._now()` writes ISO 8601 UTC strings.
+
+### Other endpoints
+
+`GET /api/health` (counts + db path), `GET /api/version` (package metadata; 503 if unavailable), `POST /api/stream-test` (streams a canned LLM reply to smoke-test SSE), `GET /api/videos`, `GET/POST/DELETE /api/conversations[/{id}]`.
 
 ---
 
-## Lint, Format, Type Check
+## Placement Rules
 
-**Backend tooling is configured in `app/backend/pyproject.toml`:** ruff (lint + format, line-length 100, target py311, conservative rule set — E/F/W/I/B/UP/SIM/RUF), mypy (lenient `strict = false`, `warn_return_any = true`, `ignore_missing_imports = true`), pytest (asyncio auto mode). All three are in the `dev` optional-dependency group and installed by `uv sync --all-extras`.
-
-**Python:**
-
-```bash
-cd app/backend
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy .
-```
-
-**TypeScript:** `eslint` + `prettier` or the combined `biome`. Prefer `biome` (one tool, fast).
-
-```bash
-cd app/frontend
-bun x biome check src
-bun x biome format --write src
-bun run tsc --noEmit           # type check
-```
-
-**Before every commit (what the validator runs):**
-
-```bash
-# Backend (from app/backend/)
-cd app/backend
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy .
-uv run pytest tests -xvs
-cd ../..
-
-# Frontend
-cd app/frontend
-bun run tsc --noEmit
-bun x biome check src
-bun run test
-```
+- New API route → new file in `app/backend/routes/`, one per resource, mounted in `main.py` under `/api`. Pydantic request/response models live in the route file unless shared.
+- New SQL → `app/backend/db/repository.py` only. Never in routes, services, or seed code.
+- Schema change → `app/backend/db/schema.py`, `CREATE TABLE IF NOT EXISTS`, portable SQL (see Database rules).
+- New RAG step → `app/backend/rag/`; keep chunker, embeddings, retriever separate.
+- New env var → read once in `app/backend/config.py` as a module constant with a default; import the constant elsewhere.
+- New React component → `app/frontend/src/components/`, one per file, named export matching filename.
+- New hook → `app/frontend/src/hooks/`, `use` prefix, returns a typed object.
+- New API call → `app/frontend/src/lib/api.ts`. Never `fetch()` in a component or new hook.
+- Backend tests → `app/backend/tests/` (pattern in `test_version.py`: `httpx.AsyncClient(transport=ASGITransport(app=app))`, plain `async def`, no marker needed). Never touch `data/chat.db`; use `tmp_path` for a temp DB.
+- Frontend tests → co-located `*.test.tsx` or `src/__tests__/`. Mock fetch with `vi.stubGlobal('fetch', ...)`.
 
 ---
 
 ## Code Conventions
 
-### Python (backend)
+### Python
 
-- **Async everywhere.** FastAPI routes are `async def`. Database calls use `aiosqlite`. Any sync blocking call (file I/O, CPU work) in a route handler is a bug — use `asyncio.to_thread` or move it to a background task.
-- **Imports:** stdlib first, third-party second, local third. Group with blank lines. No wildcard imports.
-- **Type hints:** use them on every function signature and return type. Use `list[str]` / `dict[str, int]` syntax (Python 3.9+), not `List` / `Dict` from `typing`.
-- **No `print()` in runtime code.** Use `logging` with a module-level logger: `logger = logging.getLogger(__name__)`. `print()` is acceptable in `data/seed.py` and one-off scripts.
-- **Errors:** raise specific exceptions (`ValueError`, `KeyError`, custom) with clear messages. Never `except:` bare. Avoid `except Exception` except at the outermost request handler, where FastAPI's exception handlers take over.
-- **SQL:** all queries live in `db/repository.py`. Parameterize — never use f-strings or `%` formatting to build SQL. `aiosqlite` uses `?` placeholders.
-- **Config:** every environment variable is read exactly once in `config.py` and exposed as a module-level constant. Routes and services import the constant, never `os.environ` directly.
-- **Pydantic models:** use `pydantic.BaseModel` for request/response schemas, defined in the route file that uses them (unless shared).
+- Async everywhere in routes and DB. Sync blocking calls in a handler are a bug — wrap in `asyncio.to_thread`. (Existing violation: `embed_text`/`embed_batch` use the sync `OpenAI` client and are called directly from `routes/messages.py` and `routes/ingest.py`. Fix only under an issue that covers it.)
+- Type hints on every signature; builtin generics (`list[str]`, `dict | None`), not `typing.List`.
+- `logging.getLogger(__name__)`, never `print()` in runtime code (`data/seed.py` and `config.py` startup warnings are the tolerated exceptions).
+- Specific exceptions, never bare `except:`. `except Exception` only at the outermost handler boundary.
+- Parameterized SQL with `?`; never f-string/`%` into SQL.
+- Ruff: line-length 100, py311 target, rules E/F/W/I/B/UP/SIM/RUF, double quotes. Mypy: `strict = false`, `warn_return_any`, `warn_unused_ignores` (a stale `# type: ignore` fails the check).
+- Python 3.11 is the floor (`requires-python = ">=3.11"`); don't use 3.12+ features.
 
-### TypeScript (frontend)
+### TypeScript
 
-- **Function components only.** No class components. Named exports, one component per file. File name matches component name.
-- **Hooks for state and effects.** Custom hooks live in `src/hooks/`, prefixed `use`, returning a typed object.
-- **All API calls go through `src/lib/api.ts`.** Components and hooks import from there. Never `fetch()` inline in a component.
-- **Types:** every function signature typed; no `any` except when bridging an untyped dependency with a clear comment explaining why. Prefer `interface` for object shapes, `type` for unions and aliases.
-- **Imports:** use relative paths within `src/` (no path aliases configured currently). External libraries first, then internal.
-- **Styling:** Tailwind utility classes only. No inline `style={{...}}` except for dynamic values that can't be expressed in Tailwind. No CSS modules, no styled-components.
-- **Event handlers:** typed callbacks (`(e: React.ChangeEvent<HTMLInputElement>) => void`), not `any`.
-- **State:** React built-ins (`useState`, `useReducer`, Context) only. Do not add Redux, Zustand, Jotai, or any external state library — it's out of scope.
-- **SSE parsing:** all SSE consumption goes through `useStreamingResponse`. Do not parse SSE in components or new hooks.
+- Function components, named exports, one per file. Hooks only for state; no Redux/Zustand/Jotai.
+- No `any` without a comment explaining the untyped bridge (biome warns on it).
+- Biome: single quotes, semicolons, trailing commas, 2-space indent, line width 100, `organizeImports` on. `useExhaustiveDependencies` is disabled.
+- Styling rule for new code: Tailwind utilities; inline `style={{}}` only for values Tailwind can't express. Be aware the existing components lean heavily on inline styles and custom classes from `styles/globals.css` (CSS variables, `.app-layout`, `.skeleton`, etc.). Match the local file's style when editing; don't refactor styling outside your issue's scope.
+- Relative imports only (no path aliases configured).
 
 ---
 
-## Database
+## Database Rules (Postgres-portable from day one)
 
-**Current state:** SQLite via `aiosqlite`. Database file at `app/backend/data/chat.db`, auto-created on first startup via `backend.db.schema.init_db()` called from the FastAPI lifespan handler. No ORM. No Alembic migrations. Schema is `CREATE TABLE IF NOT EXISTS` against literal SQL in `schema.py`.
+The Postgres migration is an allowed evolution once an issue is filed. Until then every new query must be a drop-in for both engines:
 
-**Tables:** `videos`, `chunks` (FK → videos), `conversations`, `messages` (FK → conversations). `PRAGMA foreign_keys=ON` and `PRAGMA journal_mode=WAL` set at connection time.
-
-### Planned migration: Postgres
-
-The factory is **allowed** to work on the Postgres migration when an issue is filed for it (this is one of the few architectural changes explicitly permitted by MISSION.md). Until then, write all new code in a Postgres-portable way so the eventual migration is a drop-in swap, not a rewrite.
-
-**Rules for new database code today:**
-
-1. **Only use SQL that is portable across SQLite and Postgres.** No `json_extract()`, no `strftime()`, no SQLite-specific pragmas baked into queries. Stick to ANSI SQL.
-2. **Never rely on SQLite's permissive typing.** Put explicit `NOT NULL`, `CHECK`, and type constraints on every new column.
-3. **Use ISO 8601 strings for timestamps**, not SQLite's `DATETIME`. Both databases round-trip ISO strings cleanly; `DATETIME` does not.
-4. **Primary keys are text UUIDs** (already the convention — keep it that way). Do not add auto-increment integer PKs; they'll complicate the Postgres migration.
-5. **When the migration happens**, `aiosqlite` will be swapped for `asyncpg` or `psycopg[binary]`. Keep all SQL in `db/repository.py` so the swap is confined to one file.
-6. **Do not introduce Alembic yet.** When the migration starts, the first PR of that effort introduces Alembic, generates an initial migration from the existing schema, and vendors it. Until then, `schema.py`'s `CREATE TABLE IF NOT EXISTS` remains authoritative.
+1. ANSI SQL only — no `json_extract()`, `strftime()`, or SQLite pragmas in queries.
+2. Explicit `NOT NULL` / `CHECK` / types on every new column.
+3. Timestamps as ISO 8601 TEXT written from Python (`_now()`), not DB-side defaults. The existing `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` columns predate this rule; don't copy the pattern.
+4. Text UUID primary keys; no auto-increment integers.
+5. No Alembic until the migration PR itself introduces it.
 
 ---
 
-## RAG Pipeline Invariants
+## RAG and Streaming Invariants (do not change without an authorizing issue)
 
-These behaviors are part of DynaChat's contract and must not regress. The agent-browser regression test verifies most of them.
-
-1. **Chunking** uses Docling `HybridChunker` with `max_tokens=512` (`HYBRID_CHUNKER_MAX_TOKENS` in `config.py`). Do not swap to recursive-character splitters or LangChain chunkers.
-2. **Embeddings** come from OpenRouter's `openai/text-embedding-3-small` (1536-dim). Never call a different embedding model or provider. Never embed on the frontend.
-3. **Retrieval** is in-process NumPy cosine similarity over all chunks, top-k = 5. This is acceptable until the library grows large. Do not introduce a vector database (FAISS, Chroma, pgvector) without an explicit issue authorizing it — that's an architectural change requiring human approval.
-4. **Chat completion** uses OpenRouter's `anthropic/claude-sonnet-4.6` via the `openai` SDK pointed at `https://openrouter.ai/api/v1`. Do not change the provider or the model in a PR — that's out of scope per MISSION.md.
-5. **Streaming format:** Server-Sent Events with JSON-encoded tokens. Each token is framed as `data: <json-string>\n\n`. The `sources` event is emitted as `event: sources\ndata: <json-array>\n\n` **before** the `data: [DONE]\n\n` terminator. Do not change this format — the frontend parser in `useStreamingResponse.ts` depends on it exactly.
-6. **Citations** must include video title, video URL, exact timestamp deep-link, and the quoted transcript snippet. The citation modal opens an embedded YouTube player at the timestamp. This is a MISSION.md quality bar — removing or regressing any of these fields is an auto-reject.
+1. Chunking: Docling `HybridChunker`, `HYBRID_CHUNKER_MAX_TOKENS = 512`. No LangChain/recursive splitters.
+2. Embeddings: `openai/text-embedding-3-small` via OpenRouter (1536-dim). Never on the frontend.
+3. Retrieval: in-process NumPy cosine, `RETRIEVAL_TOP_K = 5`. No vector DB (FAISS/Chroma/pgvector) without an explicit issue.
+4. Chat: `anthropic/claude-sonnet-4.6` via the `openai` SDK at `https://openrouter.ai/api/v1`. Provider and model are out of scope per MISSION.md.
+5. SSE format as described above.
+6. Citation fields (title, URL, timestamp deep-link, snippet, modal player) are a MISSION.md quality bar — regressing any is an auto-reject.
 
 ---
 
-## Environment Variables
+## Configuration
 
-All env var reads happen in `app/backend/config.py`. Add new variables there and import the constant elsewhere.
+`config.py` walks up parent directories from `app/backend/` and loads the first `.env` it finds. The only required variable is `OPENROUTER_API_KEY`; everything else (`OPENROUTER_BASE_URL`, `EMBEDDING_MODEL`, `CHAT_MODEL`, `DB_PATH`, `RETRIEVAL_TOP_K`, `HYBRID_CHUNKER_MAX_TOKENS`, `BACKEND_PORT=8000`, `FRONTEND_PORT=5173`) is a hardcoded constant there. No `.env.example` exists yet — create one only under an issue that asks for it.
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `OPENROUTER_API_KEY` | **yes** | Authenticates embeddings and chat completions to OpenRouter |
-
-Everything else is currently hardcoded in `config.py` (model names, ports, chunk size, top-k). When adding configurability, add the constant to `config.py` with a sensible default:
-
-```python
-NEW_CONSTANT: int = int(os.environ.get("NEW_CONSTANT", "42"))
-```
-
-**Never commit `.env` files.** `.env`, `.env.*`, and `.archon/config.yaml` are in `.gitignore` and on the protected files list in `FACTORY_RULES.md`.
+**Security-invariant paths** (FACTORY_RULES.md §5 asks CLAUDE.md to name them): CORS is configured in `app/backend/main.py` (`CORSMiddleware`, origins `localhost:5173` / `127.0.0.1:5173`). Auth middleware and the 25 msg/day rate-limit constant do not exist yet; when added, list their paths here via a human commit and treat them as protected.
 
 ---
 
-## Known Footguns (Fix These When You Touch Them)
+## Known Footguns
 
-These are existing bugs / quirks in the repo. They are fair game for the factory to fix when an issue is filed, but be aware of them so you don't accidentally depend on the broken behavior:
-
-1. **Port mismatch in `vite.config.ts`.** The dev server listens on port 5175 (`vite.config.ts`) but `config.py` reports `FRONTEND_PORT = 5173`. The API proxy target in `vite.config.ts` is also wrong — it points at port 8001 while the backend runs on 8000. If you touch `vite.config.ts` or `config.py`, fix both to agree.
-2. **Backend venv is committed to git.** `app/backend/venv/` should be in `.gitignore` but isn't. Do not remove it in an unrelated PR — file a separate issue. (The factory's implementation rules forbid "improvements" beyond the issue scope.) Note: the new uv-managed venv lives at `app/backend/.venv/` (dotted) and IS gitignored; only the legacy `app/backend/venv/` (no dot) remains checked in and should be cleaned up in a dedicated PR.
-3. **Runtime dependencies are unpinned in `pyproject.toml`** but pinned in `uv.lock`. Do not add upper bounds to `[project].dependencies` in an unrelated PR — uv's lockfile handles reproducibility already.
-4. **No `.env.example`** exists. When authorized, create one listing every variable from `config.py` with placeholder values and comments.
-5. **SSE tokens are JSON-encoded** (wrapped in quotes, escaped newlines). This is non-standard but intentional — it safely handles tokens containing newlines. The parser in `useStreamingResponse.ts` expects this exact format. Do not switch to raw-text SSE without updating both sides.
-
----
-
-## Commit and PR Conventions
-
-- **Commit messages:** conventional commits style — `feat:`, `fix:`, `chore:`, `refactor:`, `docs:`, `test:`. Subject line under 72 characters. Body explains *why*, not *what*.
-- **PR title:** same conventional-commits prefix as the first commit. Under 72 characters.
-- **PR body:** must include `Fixes #N` (or `Closes #N` / `Resolves #N`) on its own line so the validator can extract the linked issue. Missing this link causes validation to fail at behavioral-validation.
-- **New dependencies:** PR body must include a "Dependencies" section explaining what the dependency does, why existing dependencies don't work, and evidence of active maintenance. See FACTORY_RULES.md §2.
-- **One issue per PR.** Do not bundle unrelated fixes. If you notice a bug while working on something else, file a new issue rather than fixing it in the current PR.
+1. **Sync OpenAI client in async routes** (see Python conventions). Under load this blocks the event loop.
+2. **Retriever loads the whole `chunks` table per query.** Fine for the 10-video seed; will not scale. Only address under an issue.
+3. **`bun run test` fails with no test files** (exit 1). Not a broken toolchain.
+4. **`bun.lock` is gitignored** (`.gitignore` lists it), so frontend installs are not fully reproducible. `uv.lock` *is* committed and authoritative for the backend; runtime deps are intentionally unpinned in `pyproject.toml` — don't add upper bounds.
+5. **No `.env.example`** — see Configuration.
+6. **README "Manual start" is stale** (pip/requirements.txt). The uv flow above is correct.
+7. **Two `[DONE]` handling paths.** `routes/messages.py` injects `sources` by string-matching `"data: [DONE]\n\n"` from `stream_chat`; if you change the terminator in one place the sources event silently disappears.
 
 ---
 
-## Dos and Don'ts (Quick Reference)
+## Commits and PRs
 
-**Do:**
-- Read MISSION.md and FACTORY_RULES.md before starting any non-trivial task
-- Run the full validation suite (tests, lint, typecheck, agent-browser regression) before declaring a PR done
-- Keep all SQL in `db/repository.py`
-- Keep all fetch calls in `src/lib/api.ts`
-- Use portable SQL only (Postgres migration is coming)
-- Add tests for every bug fix (regression test) and every new feature
-
-**Don't:**
-- Modify `MISSION.md`, `FACTORY_RULES.md`, or `CLAUDE.md` (this file) — see FACTORY_RULES.md §5
-- Modify `.github/`, Dockerfiles, deployment configs, or `.env*` files
-- Introduce a new LLM provider, embedding model, or vector database
-- Add state management libraries to the frontend
-- Add an ORM to the backend
-- Write SQL outside `db/repository.py` or fetch calls outside `src/lib/api.ts`
-- Use SQLite-specific SQL functions — anything written today must work on Postgres tomorrow
-- "Improve" code that wasn't part of the issue you're fixing — scope discipline is enforced by the validator
+- Conventional commits (`feat:`, `fix:`, `chore:`, `refactor:`, `docs:`, `test:`), subject < 72 chars, body explains *why*.
+- PR title uses the same prefix. PR body must follow `.github/pull_request_template.md` and contain `Fixes #N` on its own line — the validator extracts the linked issue from it and fails without one.
+- One issue per PR, ≤ 500 changed lines, no protected files (`MISSION.md`, `FACTORY_RULES.md`, `CLAUDE.md`, `.github/**`, Dockerfiles/deploy configs, `.env*`, `.archon/config.yaml`).
+- New dependencies need the template's "Dependencies" section filled in (FACTORY_RULES.md §2).
+- Every bug fix ships a regression test; every feature ships tests. The validator reads only the PR body, diff, and test results (holdout principle, FACTORY_RULES.md §9) — if it isn't explained in the PR body, it isn't considered.
+- Don't "improve" code outside the issue's scope; file a new issue instead. Scope discipline is enforced.

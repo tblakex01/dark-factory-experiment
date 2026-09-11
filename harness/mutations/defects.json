@@ -1,0 +1,57 @@
+{
+  "_what_this_is": [
+    "Deliberate defects injected into REAL source on a throwaway copy of the tree. Each",
+    "must make the gate go red. One that escapes is a class of bug that can currently",
+    "merge into DynaChat with nobody reading the diff.",
+    "",
+    "This is the ONLY thing in the gate that measures the HARNESS rather than the code.",
+    "Until one of these has been injected and caught there is no evidence any check here",
+    "can fail at all.",
+    "",
+    "THIS FILE IS PROTECTED. A builder that can edit its own defect set can pass it."
+  ],
+
+  "_archetypes_covered": [
+    "an invariant raised out of range    -> cap-raised-to-100",
+    "an output made constant            -> lock-key-is-constant",
+    "a normaliser dropped               -> uuid-normaliser-dropped",
+    "a guard removed                    -> conversations-list-loses-its-guard",
+    "",
+    "All four aim at MISSION hard invariants 1 and 2, which are the two the factory is",
+    "least able to recover from getting wrong and the two issue #361 turned on."
+  ],
+
+  "_written": "2026-08-13, at the same time as the holdout. See .factory/holdout/run.py for why that date is stated rather than buried.",
+
+  "defects": [
+    {
+      "id": "cap-raised-to-100",
+      "file": "app/backend/rate_limit.py",
+      "find": "DAILY_MESSAGE_CAP: int = 25",
+      "replace": "DAILY_MESSAGE_CAP: int = 100",
+      "why": "MISSION hard invariant 1 is a specific number, not 'there is a limit'. A cap silently raised 4x still rate-limits, still passes every test that asserts a limit exists, and quietly quadruples the OpenRouter bill this invariant was written to protect."
+    },
+    {
+      "id": "lock-key-is-constant",
+      "file": "app/backend/rate_limit.py",
+      "find": "    key = hi ^ lo",
+      "replace": "    key = (hi ^ lo) % 1",
+      "why": "An output made constant. Every user now serialises on ONE advisory lock: the limiter still works for a single user and still passes its unit tests, but under concurrency unrelated users block each other, and a shared lock is one refactor away from a shared COUNT.",
+      "_why_this_shape": "`% 1` rather than `= 0` ON PURPOSE. The obvious mutation leaves `hi` and `lo` unused, so ruff flags it and STATIC catches a defect that was meant to probe the holdout. This version still reads both halves and still type-checks, so it is invisible to every rung below the independence line - which is the only way this defect measures the thing it was written to measure."
+    },
+    {
+      "id": "uuid-normaliser-dropped",
+      "file": "app/backend/rate_limit.py",
+      "find": "    uid = _as_uuid(user_id)",
+      "replace": "    uid = user_id",
+      "why": "The two entry points accept UUID | str and normalise before deriving the lock key. Drop it on one path and that path locks under a different key from the other, so the two stop serialising and the effective cap doubles. Invisible to either function's own test."
+    },
+    {
+      "id": "conversations-list-loses-its-guard",
+      "file": "app/backend/routes/conversations.py",
+      "find": "async def list_conversations(current_user: dict[str, Any] = Depends(get_current_user)):",
+      "replace": "async def list_conversations():",
+      "why": "A guard removed. MISSION hard invariant 2 - authentication required for all chat access. The route still returns data, the app still boots, and every OTHER auth test still passes, because they each call a route they already know about. Only a check that walks the assembled app can see a route that lost its dependency."
+    }
+  ]
+}

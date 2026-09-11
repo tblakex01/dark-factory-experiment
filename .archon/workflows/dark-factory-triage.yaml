@@ -168,7 +168,33 @@ nodes:
         case "$verdict" in
           accept)
             body="**Dark Factory triage:** accepted"$'\n\n'"${reason}"$'\n\n'"_Priority: ${priority} | Type: ${classification}_"
+
+            # Strip stale priority:* / type:* labels so triage's verdict is
+            # authoritative. Without this, a label already on the issue (from
+            # the author pre-tagging, or a prior triage run that disagreed)
+            # lingers alongside the new one and the issue ends up with two
+            # conflicting classifications. Query first because
+            # `gh issue edit --remove-label` errors on labels that aren't
+            # currently applied.
+            current_labels=$(gh issue view "$num" --json labels --jq '.labels[].name')
+            REMOVE_ARGS=()
+            while IFS= read -r lbl; do
+              case "$lbl" in
+                priority:*)
+                  if [ "$lbl" != "priority:$priority" ]; then
+                    REMOVE_ARGS+=(--remove-label "$lbl")
+                  fi
+                  ;;
+                type:*)
+                  if [ "$lbl" != "type:$classification" ]; then
+                    REMOVE_ARGS+=(--remove-label "$lbl")
+                  fi
+                  ;;
+              esac
+            done <<< "$current_labels"
+
             gh issue edit "$num" \
+              "${REMOVE_ARGS[@]}" \
               --add-label "factory:accepted" \
               --add-label "priority:$priority" \
               --add-label "type:$classification"

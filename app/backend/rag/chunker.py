@@ -6,12 +6,19 @@ and returns a list of contextualized text strings ready for embedding.
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 import tiktoken
 from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.transforms.chunker.tokenizer.openai import OpenAITokenizer
 from docling_core.types.doc.document import DocItemLabel, DoclingDocument
 
 from backend.config import HYBRID_CHUNKER_MAX_TOKENS
+
+logger = logging.getLogger(__name__)
+
+TimestampedSegment = dict[str, Any]
 
 # Conservative character-length proxy for 512 tokens.
 # ~4 chars/token x 512 tokens ~ 2048; we use 2400 to be safe but still below
@@ -83,9 +90,171 @@ def chunk_video(video: dict) -> list[str]:
     return results
 
 
+def chunk_video_timestamped(segments: list[TimestampedSegment]) -> tuple[list[dict], bool]:
+    """
+    Chunk timestamped transcript segments using Docling HybridChunker.
+
+    Each segment already has precise start/end timestamps from the source
+    (e.g. Supadata). We run HybridChunker on each segment's text to get
+    contextualized content, but store the original uncontextualized segment
+    text as the snippet and preserve the segment's start/end as chunk boundaries.
+
+    Args:
+        segments: A list of dicts with keys 'start' (float), 'end' (float),
+                  'text' (str). Timestamps are in seconds.
+
+    Returns:
+        A tuple of (chunks, had_errors) where chunks is a list of dicts:
+          - content: str (contextualized HybridChunker output)
+          - start_seconds: float
+          - end_seconds: float
+          - snippet: str (original uncontextualized segment text)
+        had_errors is True if any chunker operation fell back to raw text.
+        Returns ([], False) if segments is empty or all texts are empty.
+    """
+    if not segments:
+        return [], False
+
+    tokenizer = OpenAITokenizer(
+        tokenizer=tiktoken.get_encoding("cl100k_base"),
+        max_tokens=HYBRID_CHUNKER_MAX_TOKENS,
+    )
+    chunker = HybridChunker(tokenizer=tokenizer, merge_peers=True)
+
+    results: list[dict] = []
+    had_errors = False
+
+    for segment in segments:
+        text: str = segment.get("text", "")
+        if not text:
+            continue
+
+        start_s: float = segment.get("start", 0.0)
+        end_s: float = segment.get("end", 0.0)
+
+        doc = _build_docling_document_from_text(text)
+        try:
+            chunk_iter = chunker.chunk(doc)
+            sub_chunks: list[dict] = []
+            for chunk in chunk_iter:
+                try:
+                    contextualized = chunker.contextualize(chunk)
+                    content = contextualized.strip() if contextualized else ""
+                except Exception as exc:
+                    logger.warning(
+                        "contextualize failed for segment starting at %s: %s", start_s, exc
+                    )
+                    content = getattr(chunk, "text", "") or text
+                    content = content.strip()
+                    had_errors = True
+
+                if not content:
+                    continue
+
+                sub_chunks.append(
+                    {
+                        "content": content,
+                        "start_seconds": start_s,
+                        "end_seconds": end_s,
+                        "snippet": text[:300],
+                    }
+                )
+
+            # Distribute timestamps evenly across sub-chunks when HybridChunker
+            # splits a segment into multiple pieces (no worse than fallback's
+            # proportional timestamps, which are explicitly accepted).
+            if len(sub_chunks) > 1:
+                duration = end_s - start_s
+                # Only distribute when there is a span to distribute.
+                #
+                # For duration == 0 this guard is a no-op by arithmetic --
+                # step is 0, so start_s + i*0 == start_s either way -- and
+                # that is the honest answer: a zero-width segment has no
+                # information to spread, and manufacturing one would invent
+                # deep-link targets. Sources with no per-segment duration
+                # (Dynamous lesson bodies with no timestamp markers, a
+                # Supadata segment with duration absent) land here.
+                #
+                # It is NOT a no-op for duration < 0, which is what makes it
+                # worth keeping: dividing a negative duration produced a run
+                # of progressively *earlier* windows (90->70, 70->50, 50->30)
+                # that look like real, distinct, precise timestamps and are
+                # entirely fabricated.
+                if duration > 0:
+                    step = duration / len(sub_chunks)
+                    for i, sc in enumerate(sub_chunks):
+                        sc["start_seconds"] = start_s + i * step
+                        sc["end_seconds"] = start_s + (i + 1) * step
+
+            results.extend(sub_chunks)
+        except Exception as exc:
+            logger.warning("chunker.chunk failed for segment starting at %s: %s", start_s, exc)
+            results.append(
+                {
+                    "content": text.strip(),
+                    "start_seconds": start_s,
+                    "end_seconds": end_s,
+                    "snippet": text[:300],
+                }
+            )
+            had_errors = True
+
+    return results, had_errors
+
+
+def chunk_video_fallback(video: dict) -> tuple[list[dict], bool]:
+    """
+    Chunk a video using the existing plain-text chunk_video() function,
+    then add evenly-spaced estimated timestamps.
+
+    Used when no precise segment timestamps are available (e.g. legacy ingest,
+    plain transcript input). The estimated timestamps are monotonic but
+    imprecise.
+
+    Args:
+        video: A dict with at minimum 'title' and 'transcript' keys.
+
+    Returns:
+        A tuple of (chunks, had_errors) where chunks are dicts as per
+        chunk_video_timestamped, with estimated start/end times and
+        snippet = first 300 chars of content. had_errors is True when
+        chunk_video returned an empty list (could indicate a chunker failure).
+    """
+    chunk_texts: list[str] = chunk_video(video)
+    if not chunk_texts:
+        return [], True
+
+    transcript: str = video.get("transcript", "")
+    # Heuristic: estimate 150 WPM for YouTube transcripts
+    total_words = len(transcript.split())
+    estimated_duration = max(total_words / 150.0, 1.0)
+    step = estimated_duration / len(chunk_texts) if chunk_texts else 0.0
+
+    results: list[dict] = []
+    for i, content in enumerate(chunk_texts):
+        start_s = round(i * step, 2)
+        end_s = round((i + 1) * step, 2)
+        results.append(
+            {
+                "content": content,
+                "start_seconds": start_s,
+                "end_seconds": end_s,
+                "snippet": content[:300],
+            }
+        )
+    return results, False
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_docling_document_from_text(text: str) -> DoclingDocument:
+    """Build a minimal DoclingDocument from a single text string (used for segments)."""
+    doc = DoclingDocument(name="segment")
+    doc.add_text(label=DocItemLabel.PARAGRAPH, text=text)
+    return doc
 
 
 def _build_docling_document(title: str, transcript: str) -> DoclingDocument:
@@ -131,26 +300,19 @@ def _enforce_max_chars(chunks: list[str], max_chars: int) -> list[str]:
 
 def _split_text(text: str, max_chars: int) -> list[str]:
     """
-    Recursively split *text* into pieces each ≤ max_chars.
-    Tries double-newline splits first, then sentence splits.
+    Split *text* into pieces each ≤ max_chars.
+    Tries separators in order: double-newline, single-newline, sentence, then hard-cut.
     """
     if len(text) <= max_chars:
         return [text] if text.strip() else []
 
-    # Try splitting on double newline (paragraph boundary)
-    parts = text.split("\n\n")
-    if len(parts) > 1:
-        return _group_parts(parts, max_chars, sep="\n\n")
-
-    # Try splitting on single newline
-    parts = text.split("\n")
-    if len(parts) > 1:
-        return _group_parts(parts, max_chars, sep="\n")
-
-    # Try splitting on ". " (sentence boundary)
-    parts = text.split(". ")
-    if len(parts) > 1:
-        return _group_parts(parts, max_chars, sep=". ")
+    # Try each separator in priority order
+    for sep in ("\n\n", "\n", ". "):
+        parts = text.split(sep)
+        if len(parts) > 1:
+            grouped = _group_parts(parts, max_chars, sep)
+            if len(grouped) > 1 or (len(grouped) == 1 and len(grouped[0]) <= max_chars):
+                return grouped
 
     # Last resort: hard-cut at max_chars
     pieces: list[str] = []

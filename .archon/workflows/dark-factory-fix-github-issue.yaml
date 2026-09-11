@@ -135,13 +135,38 @@ nodes:
     depends_on: [validate]
     context: fresh
 
+  # Deterministic PR number capture: reads .pr-number if the AI wrote it,
+  # otherwise extracts via gh pr view. Outputs ONLY the number so
+  # downstream nodes can use $capture-pr-number.output as the PR ref.
+  # This fixes #13 where review-scope received the issue number instead.
+  - id: capture-pr-number
+    bash: |
+      set -euo pipefail
+      if [ -f "$ARTIFACTS_DIR/.pr-number" ]; then
+        PR=$(cat "$ARTIFACTS_DIR/.pr-number" | tr -d ' \n\r')
+        if echo "$PR" | grep -qE '^[0-9]+$'; then
+          echo "$PR"
+          exit 0
+        fi
+      fi
+      PR=$(gh pr view --json number -q '.number' 2>/dev/null || true)
+      if [ -n "$PR" ]; then
+        echo "$PR" > "$ARTIFACTS_DIR/.pr-number"
+        echo "$PR"
+      else
+        echo "WARNING: could not determine PR number" >&2
+        echo "0"
+      fi
+    depends_on: [create-pr]
+    timeout: 15000
+
   # ═══════════════════════════════════════════════════════════════
   # PHASE 7: REVIEW
   # ═══════════════════════════════════════════════════════════════
 
   - id: review-scope
-    command: archon-pr-review-scope
-    depends_on: [create-pr]
+    command: dark-factory-pr-review-scope
+    depends_on: [capture-pr-number]
     context: fresh
 
   - id: review-classify
@@ -240,3 +265,27 @@ nodes:
     command: archon-issue-completion-report
     depends_on: [simplify]
     context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 11: CLEANUP ISSUE LABEL
+  # ═══════════════════════════════════════════════════════════════
+  # The orchestrator stamps `factory:in-progress` on the issue when it
+  # dispatches this workflow. Once the PR exists, the work-in-progress
+  # state lives on the PR (via factory:needs-review) and the issue's
+  # label is stale. Runs with trigger_rule: all_done so a late-stage
+  # failure (self-fix, simplify, report) can't leave the issue stuck
+  # on in-progress forever.
+  - id: cleanup-issue-label
+    bash: |
+      set -euo pipefail
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "No issue number parsed — nothing to clean up"
+        exit 0
+      fi
+      # --remove-label is idempotent (succeeds if the label isn't present)
+      gh issue edit "$ISSUE_NUM" --remove-label "factory:in-progress" 2>&1 || true
+      echo "Cleared factory:in-progress from issue #$ISSUE_NUM"
+    depends_on: [report]
+    trigger_rule: all_done
+    timeout: 15000

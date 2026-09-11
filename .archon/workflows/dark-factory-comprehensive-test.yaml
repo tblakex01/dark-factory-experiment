@@ -1,0 +1,476 @@
+name: dark-factory-comprehensive-test
+description: |
+  Use when: Weekly cron fires a full end-to-end regression against `main` of
+            the dark-factory-experiment repo. NOT triggered by the 4-hour
+            orchestrator - runs on its own separate schedule.
+  Triggers: Weekly cron (0 6 * * 1 UTC), or manual "run comprehensive test".
+  Does: Checks out main -> starts backend+frontend on dynamic free ports ->
+        runs 4 agent-browser scenarios sequentially against the real UI
+        (chat, video ingestion, RAG citations, conversation history) ->
+        tears down -> synthesizes a report -> auto-files GitHub issues on
+        failures (with dedup) so triage picks them up and the factory
+        heals itself.
+  NOT for: Per-PR validation (dark-factory-validate-pr), triage
+           (dark-factory-triage), issue implementation
+           (dark-factory-fix-github-issue).
+
+  =====================================================================
+  WHY THIS EXISTS - the self-healing loop
+  =====================================================================
+
+  This workflow closes the feedback loop that makes the Dark Factory actually
+  self-evolving: comprehensive test finds a regression in running code -> files
+  a GitHub issue with evidence -> triage accepts it -> fix-github-issue opens
+  a PR -> validate-pr holds it out -> merge. No human in the loop unless all
+  of that fails.
+
+  Unlike validate-pr, this workflow is NOT bound by the holdout principle -
+  it runs against main (which is already merged code), so there's nothing to
+  hold out from. It can read anything, run anything, and its only output is
+  "did this feature still work when I exercised it through the browser?".
+
+  Prerequisite: `agent-browser` must be installed and available on PATH. On
+  the dark-factory VPS this is installed globally (v0.25.3 + Chrome for
+  Testing). Locally, `npm i -g agent-browser && agent-browser install`.
+  See the `.claude/skills/agent-browser/SKILL.md` skill for CLI reference.
+
+  =====================================================================
+  TEST FIXTURES (locked)
+  =====================================================================
+
+  Canonical test YouTube video for ingestion + RAG scenarios:
+    https://www.youtube.com/watch?v=pjF-0dliYhg
+
+  This URL is referenced by test-video-ingestion AND test-rag-response -
+  ingestion adds it to the library, then the RAG test asks a question
+  grounded in its transcript and asserts the response cites it. Do NOT
+  change this URL without updating both scenario command files together.
+
+provider: claude
+model: sonnet
+
+nodes:
+  # =====================================================================
+  # PHASE 1: SETUP - checkout main, install deps, start the app
+  # =====================================================================
+
+  - id: pull-latest
+    bash: |
+      set -euo pipefail
+      # Snap this worktree's file content to origin/main's tip.
+      #
+      # We deliberately do NOT `git checkout main` here. Archon spawns this
+      # workflow in a *linked* worktree, and the user's main working tree
+      # already holds branch `main` - git refuses to have the same branch
+      # checked out in two worktrees at once, so the checkout fails with:
+      #   fatal: 'main' is already used by worktree at '...'
+      # The validate-pr workflow's stale-worktree-prune pattern doesn't
+      # apply here either: it searches for worktrees holding a PR branch
+      # (which only Archon ever checks out), but `main` is legitimately
+      # held by the user's primary clone. We must NEVER force-remove that.
+      #
+      # Fetch + hard-reset gives us main's exact file content without ever
+      # needing to flip HEAD onto the `main` branch. We intentionally do
+      # not `git clean -fd .archon/` - that line was wiping the in-flight
+      # workflow YAML from the Archon worktree itself. `git reset --hard`
+      # already restores tracked files to origin/main, which is all we
+      # need.
+      git fetch origin main --quiet
+      git reset --hard origin/main
+      echo "Reset to origin/main at $(git rev-parse --short HEAD)"
+    timeout: 60000
+
+  - id: allocate-ports
+    bash: |
+      set -euo pipefail
+      # Backend MUST use port 8000. The Vite dev server proxy in
+      # vite.config.ts is hardcoded to forward /api/* to localhost:8000.
+      # The frontend code (api.ts) uses relative `/api/...` paths that
+      # go through this proxy. Using a dynamic backend port breaks
+      # every browser-based test because the proxy target doesn't match.
+      #
+      # If port 8000 is occupied (e.g. another workflow is running),
+      # fail fast rather than silently starting on a port the frontend
+      # can't reach.
+      BACKEND_PORT=8000
+      if (echo >/dev/tcp/127.0.0.1/$BACKEND_PORT) 2>/dev/null; then
+        echo "ERROR: port $BACKEND_PORT already in use - cannot start backend" >&2
+        exit 1
+      fi
+
+      # Frontend port can be dynamic - agent-browser reads it from the
+      # artifact file and connects directly.
+      find_free_port() {
+        local start=$1 end=$2
+        for port in $(seq $start $end); do
+          if ! (echo >/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+            echo $port; return 0
+          fi
+        done
+        echo "ERROR: no free port in range $start-$end" >&2; return 1
+      }
+      FRONTEND_PORT=$(find_free_port 16100 16999)
+
+      echo "$BACKEND_PORT"  > "$ARTIFACTS_DIR/.backend-port"
+      echo "$FRONTEND_PORT" > "$ARTIFACTS_DIR/.frontend-port"
+      echo "Allocated backend=$BACKEND_PORT frontend=$FRONTEND_PORT"
+    depends_on: [pull-latest]
+    timeout: 10000
+
+  - id: install-deps
+    bash: |
+      set -euo pipefail
+      export PATH="$HOME/.local/bin:$PATH"
+      echo "=== Backend deps (uv sync) ==="
+      (cd app/backend && uv sync --all-extras 2>&1 | tail -10)
+      echo ""
+      echo "=== Frontend deps (bun install) ==="
+      (cd app/frontend && bun install 2>&1 | tail -10)
+    depends_on: [pull-latest]
+    idle_timeout: 300000
+
+  - id: start-app
+    bash: |
+      set -euo pipefail
+      export PATH="$HOME/.local/bin:$PATH"
+
+      # Load the validation-sandbox env file. The backend hard-requires
+      # DATABASE_URL (Postgres) and other secrets at import time; without
+      # sourcing validation.env, uvicorn crashes at backend/config.py
+      # before the /api/health endpoint ever responds and all four agent-
+      # browser scenarios get skipped with no evidence. Same pattern as
+      # validate-pr's start-app (commit 3fc03a0).
+      #
+      # Path is overridable via DARK_FACTORY_VALIDATION_ENV; defaults to
+      # /opt/dark-factory/validation.env on the VPS. That file must exist
+      # outside the repo and contain at minimum:
+      #   DATABASE_URL, OPENROUTER_API_KEY, JWT_SECRET, SUPADATA_API_KEY,
+      #   YOUTUBE_CHANNEL_ID
+      # Use a DEDICATED validation database — not production — so the
+      # weekly comprehensive test can't pollute real user data even when
+      # scenarios create conversations / ingest videos.
+      VALIDATION_ENV="${DARK_FACTORY_VALIDATION_ENV:-/opt/dark-factory/validation.env}"
+      if [ -f "$VALIDATION_ENV" ]; then
+        echo "Loading validation env from $VALIDATION_ENV"
+        set -a
+        # shellcheck disable=SC1090
+        . "$VALIDATION_ENV"
+        set +a
+      else
+        echo "WARN: validation env file not found at $VALIDATION_ENV" >&2
+        echo "WARN: backend will likely fail to boot without DATABASE_URL and friends" >&2
+      fi
+
+      # Fail fast with a clear message if required vars are missing, so
+      # this node's error lands in the comprehensive-test-report rather
+      # than a cryptic uvicorn stacktrace inside $ARTIFACTS_DIR/app-logs.
+      REQUIRED_VARS=(DATABASE_URL OPENROUTER_API_KEY JWT_SECRET SUPADATA_API_KEY YOUTUBE_CHANNEL_ID)
+      MISSING=()
+      for v in "${REQUIRED_VARS[@]}"; do
+        if [ -z "${!v:-}" ]; then MISSING+=("$v"); fi
+      done
+      if [ ${#MISSING[@]} -gt 0 ]; then
+        echo "ERROR: required env vars missing for comprehensive-test sandbox: ${MISSING[*]}" >&2
+        echo "ERROR: populate $VALIDATION_ENV (outside the repo) and retry." >&2
+        exit 1
+      fi
+
+      BACKEND_PORT=$(cat "$ARTIFACTS_DIR/.backend-port")
+      FRONTEND_PORT=$(cat "$ARTIFACTS_DIR/.frontend-port")
+
+      mkdir -p "$ARTIFACTS_DIR/app-logs"
+
+      # Backend: uvicorn on dynamic port, logs to artifacts
+      (
+        cd app
+        nohup uv --project backend run uvicorn backend.main:app \
+          --host 127.0.0.1 --port "$BACKEND_PORT" \
+          > "$ARTIFACTS_DIR/app-logs/backend.log" 2>&1 &
+        echo $! > "$ARTIFACTS_DIR/.backend-pid"
+      )
+
+      # Frontend: vite dev server on dynamic port, with VITE_API_BASE set so
+      # the frontend hits the right backend port (the vite proxy is known
+      # broken - see CLAUDE.md footguns).
+      (
+        cd app/frontend
+        VITE_API_BASE="http://127.0.0.1:$BACKEND_PORT" \
+        nohup bun run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT" --strictPort \
+          > "$ARTIFACTS_DIR/app-logs/frontend.log" 2>&1 &
+        echo $! > "$ARTIFACTS_DIR/.frontend-pid"
+      )
+
+      # Wait for backend health. DynaChat exposes /api/health (NOT /health).
+      echo "Waiting for backend on :$BACKEND_PORT ..."
+      for i in $(seq 1 60); do
+        if curl -sf "http://127.0.0.1:$BACKEND_PORT/api/health" > /dev/null 2>&1; then
+          echo "backend up after ${i}s"; break
+        fi
+        if [ $i -eq 60 ]; then
+          echo "ERROR: backend failed to start in 60s" >&2
+          tail -50 "$ARTIFACTS_DIR/app-logs/backend.log" >&2
+          exit 1
+        fi
+        sleep 1
+      done
+
+      echo "Waiting for frontend on :$FRONTEND_PORT ..."
+      for i in $(seq 1 60); do
+        if curl -sf "http://127.0.0.1:$FRONTEND_PORT" > /dev/null 2>&1; then
+          echo "frontend up after ${i}s"; break
+        fi
+        if [ $i -eq 60 ]; then
+          echo "ERROR: frontend failed to start in 60s" >&2
+          tail -50 "$ARTIFACTS_DIR/app-logs/frontend.log" >&2
+          exit 1
+        fi
+        sleep 1
+      done
+
+      # Capture initial health snapshot for the ingestion test to diff against
+      curl -sf "http://127.0.0.1:$BACKEND_PORT/api/health" \
+        > "$ARTIFACTS_DIR/health-before.json" || true
+
+      echo "APP_STARTED backend=$BACKEND_PORT frontend=$FRONTEND_PORT"
+    depends_on: [install-deps, allocate-ports]
+    idle_timeout: 180000
+
+  # =====================================================================
+  # PHASE 2: SCENARIO TESTS (sequential, agent-browser state is global)
+  # =====================================================================
+  # agent-browser maintains a single shared browser session on the VPS.
+  # Parallel scenario nodes would race each other opening/closing the same
+  # session. Run them sequentially in a chain. Latency is irrelevant - this
+  # is a weekly run.
+  #
+  # Each scenario node:
+  #   - runs in fresh context (no knowledge of other scenarios)
+  #   - has allowed_tools: [Bash] + skills: [agent-browser]
+  #   - outputs structured JSON via output_format
+  #   - writes $ARTIFACTS_DIR/test-<name>.md as human-readable evidence
+  #   - takes at least one screenshot for proof
+
+  - id: test-chat-ui
+    command: dark-factory-test-chat-ui
+    depends_on: [start-app]
+    context: fresh
+    skills: [agent-browser]
+    idle_timeout: 300000
+    output_format:
+      type: object
+      properties:
+        status: { type: string, enum: ["pass", "fail"] }
+        summary: { type: string }
+        evidence: { type: array, items: { type: string } }
+        failure_reason: { type: ["string", "null"] }
+      required: [status, summary, evidence, failure_reason]
+
+  - id: test-video-ingestion
+    command: dark-factory-test-video-ingestion
+    depends_on: [test-chat-ui]
+    context: fresh
+    skills: [agent-browser]
+    idle_timeout: 600000
+    output_format:
+      type: object
+      properties:
+        status: { type: string, enum: ["pass", "fail"] }
+        summary: { type: string }
+        evidence: { type: array, items: { type: string } }
+        failure_reason: { type: ["string", "null"] }
+      required: [status, summary, evidence, failure_reason]
+
+  - id: test-rag-response
+    command: dark-factory-test-rag-response
+    depends_on: [test-video-ingestion]
+    context: fresh
+    skills: [agent-browser]
+    idle_timeout: 300000
+    output_format:
+      type: object
+      properties:
+        status: { type: string, enum: ["pass", "fail"] }
+        summary: { type: string }
+        evidence: { type: array, items: { type: string } }
+        failure_reason: { type: ["string", "null"] }
+      required: [status, summary, evidence, failure_reason]
+
+  - id: test-conversation-history
+    command: dark-factory-test-conversation-history
+    depends_on: [test-rag-response]
+    context: fresh
+    skills: [agent-browser]
+    idle_timeout: 300000
+    output_format:
+      type: object
+      properties:
+        status: { type: string, enum: ["pass", "fail"] }
+        summary: { type: string }
+        evidence: { type: array, items: { type: string } }
+        failure_reason: { type: ["string", "null"] }
+      required: [status, summary, evidence, failure_reason]
+
+  # =====================================================================
+  # PHASE 3: TEARDOWN - must always run (trigger_rule: all_done)
+  # =====================================================================
+
+  - id: teardown
+    bash: |
+      set +e
+      if [ -f "$ARTIFACTS_DIR/.backend-pid" ]; then
+        BACKEND_PID=$(cat "$ARTIFACTS_DIR/.backend-pid")
+        kill "$BACKEND_PID" 2>/dev/null && echo "killed backend PID $BACKEND_PID" || echo "backend already dead"
+      fi
+      if [ -f "$ARTIFACTS_DIR/.frontend-pid" ]; then
+        FRONTEND_PID=$(cat "$ARTIFACTS_DIR/.frontend-pid")
+        kill "$FRONTEND_PID" 2>/dev/null && echo "killed frontend PID $FRONTEND_PID" || echo "frontend already dead"
+      fi
+      # Best-effort close any lingering agent-browser session
+      agent-browser close 2>/dev/null || true
+      echo "TEARDOWN_COMPLETE"
+    depends_on:
+      - test-chat-ui
+      - test-video-ingestion
+      - test-rag-response
+      - test-conversation-history
+    trigger_rule: all_done
+    timeout: 30000
+
+  # =====================================================================
+  # PHASE 4: REPORT + FILE ISSUES
+  # =====================================================================
+
+  - id: report
+    command: dark-factory-comprehensive-report
+    depends_on: [teardown]
+    context: fresh
+    idle_timeout: 180000
+
+  - id: file-issues
+    depends_on: [report]
+    bash: |
+      set -euo pipefail
+      REPORT="$ARTIFACTS_DIR/comprehensive-test-report.md"
+      if [ ! -f "$REPORT" ]; then
+        echo "ERROR: report file missing at $REPORT" >&2
+        exit 1
+      fi
+
+      # Infra-failure guard (belt-and-suspenders with the report prompt).
+      # If fewer than 4 test-*.md files exist, the scenario nodes were
+      # skipped (an upstream node failed) and any "failures" the report
+      # enumerates are fabricated - the synthesizer saw missing files and
+      # called them FAIL. Do NOT file issues in that case; the factory
+      # must never spam GitHub with bogus product bugs when it cannot
+      # prove its own test harness ran. This is the comprehensive-test
+      # analog of validate-pr's Fix #8 "rule 0".
+      TEST_MD_COUNT=$(find "$ARTIFACTS_DIR" -maxdepth 1 -name "test-*.md" 2>/dev/null | wc -l)
+      TEST_MD_COUNT=$(echo "$TEST_MD_COUNT" | tr -d ' ')
+      if [ "$TEST_MD_COUNT" -lt 4 ]; then
+        echo "INFRA_FAILURE: found $TEST_MD_COUNT test-*.md files (expected 4)."
+        echo "Scenarios were skipped or crashed before writing evidence."
+        echo "Not filing any issues."
+        echo "[]" > "$ARTIFACTS_DIR/filed-issues.json"
+        # NON-ZERO, and this used to be `exit 0`. A harness that could not prove it ran
+        # is not a harness that found nothing wrong, and exiting successfully made a
+        # broken regression run indistinguishable from a clean one in every log and
+        # every notification. The run is failed; FACTORY_RULES.md 4 escalates on two
+        # consecutive failures, which is exactly the signal wanted here.
+        exit 1
+      fi
+      echo "SCENARIOS_RAN=$TEST_MD_COUNT"
+
+      # Extract the JSON block from the report. The report synthesizer
+      # wraps the failure list in a ```json fenced block.
+      FAILURES_JSON=$(awk '
+        /^```json/ {flag=1; next}
+        /^```/     {flag=0}
+        flag        {print}
+      ' "$REPORT")
+
+      # EMPTY IS NOT PASS.
+      #
+      # This block used to say "no JSON failure block found - treating as 0 failures"
+      # and set FAILURES_JSON="[]". That is the precise shape of the bug this factory
+      # exists to warn people about: a step whose OUTPUT could not be read was scored as
+      # a step that found nothing wrong. A synthesizer that crashed, got truncated, or
+      # stopped fencing its output printed "Comprehensive test: ALL GREEN" and filed no
+      # issues, on a run where nothing had been checked at all.
+      #
+      # The synthesizer's contract (`dark-factory-comprehensive-report.md`) requires an
+      # empty array inside the block when there are zero failures. So a MISSING block is
+      # never "no failures" - it is always the synthesizer having failed to do its job,
+      # and there is no reading of it that is good news.
+      if [ -z "$FAILURES_JSON" ]; then
+        echo "REPORT_UNPARSEABLE: no fenced json block in $REPORT" >&2
+        echo "The synthesizer must emit [] when there are zero failures, so an absent" >&2
+        echo "block means it failed. This run proved nothing and is not green." >&2
+        exit 1
+      fi
+
+      if ! COUNT=$(echo "$FAILURES_JSON" | jq 'length' 2>/dev/null); then
+        echo "REPORT_UNPARSEABLE: the fenced block is not valid JSON" >&2
+        exit 1
+      fi
+      echo "REPORT_PARSED failures=$COUNT"
+
+      if [ "$COUNT" = "0" ]; then
+        echo "No failures to file. Comprehensive test: ALL GREEN."
+        echo "[]" > "$ARTIFACTS_DIR/filed-issues.json"
+        echo "FILE_ISSUES_OK filed=0 scenarios=$TEST_MD_COUNT"
+        exit 0
+      fi
+
+      > "$ARTIFACTS_DIR/filed-issues.json.tmp"
+      echo "[" > "$ARTIFACTS_DIR/filed-issues.json.tmp"
+      FIRST=1
+
+      echo "$FAILURES_JSON" | jq -c '.[]' | while read -r failure; do
+        TITLE=$(echo "$failure" | jq -r '.title')
+        BODY=$(echo "$failure" | jq -r '.body')
+        SCENARIO=$(echo "$failure" | jq -r '.scenario')
+
+        # Dedup: search open issues with the same title already labeled
+        # factory:from-comprehensive-test. If one exists, skip creating a
+        # duplicate - the existing issue will continue through the triage
+        # pipeline on its own.
+        EXISTING=$(gh issue list \
+          --state open \
+          --label "factory:from-comprehensive-test" \
+          --search "$TITLE in:title" \
+          --json number,title \
+          --jq '.[0].number // empty')
+
+        if [ -n "$EXISTING" ]; then
+          echo "Skipping duplicate of #$EXISTING for scenario=$SCENARIO"
+          NUMBER="$EXISTING"
+          ACTION="deduped"
+        else
+          NUMBER=$(gh issue create \
+            --title "$TITLE" \
+            --body  "$BODY" \
+            --label "bug" \
+            --label "factory:from-comprehensive-test" \
+            | awk -F/ '{print $NF}')
+          echo "Filed issue #$NUMBER for scenario=$SCENARIO"
+          ACTION="created"
+        fi
+
+        if [ $FIRST -eq 0 ]; then
+          echo "," >> "$ARTIFACTS_DIR/filed-issues.json.tmp"
+        fi
+        FIRST=0
+        echo "{\"scenario\":\"$SCENARIO\",\"issue\":$NUMBER,\"action\":\"$ACTION\"}" \
+          >> "$ARTIFACTS_DIR/filed-issues.json.tmp"
+      done
+
+      echo "" >> "$ARTIFACTS_DIR/filed-issues.json.tmp"
+      echo "]" >> "$ARTIFACTS_DIR/filed-issues.json.tmp"
+      mv "$ARTIFACTS_DIR/filed-issues.json.tmp" "$ARTIFACTS_DIR/filed-issues.json"
+
+      echo "=== filed-issues.json ==="
+      cat "$ARTIFACTS_DIR/filed-issues.json"
+      # A positive marker with a count, so a downstream reader can tell this node from
+      # one that died halfway through the loop with a half-written file.
+      echo "FILE_ISSUES_OK filed=$(jq 'length' "$ARTIFACTS_DIR/filed-issues.json") scenarios=$TEST_MD_COUNT"
+    timeout: 120000

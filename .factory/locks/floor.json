@@ -1,0 +1,20 @@
+{
+  "_what_this_is": "THE RATCHET. Protected, so only a human commit can move these numbers. The gate asserts observed >= floor, and a second check asserts floor(head) >= floor(base) - so 'delete the assertion and lower the number in the same commit' is not available.",
+
+  "_slack_is_zero_here_on_purpose": "These are set EQUAL to what the harness currently observes, not below it. The gap between observed and floor is exactly the number of assertions that can be deleted with the gate still green, and it GROWS as the harness improves, because raising the floor is a protected edit the factory cannot make. Zero slack forces the raise into the same human commit that accepts the new assertions, which is mildly annoying every time and is the entire reason the number means something.",
+
+  "unit_tests": 549,
+  "static_checks": 5,
+  "holdout_assertions": 9,
+  "mutations_total": 4,
+
+  "_measured_2026_08_13": "python harness/ci.py --quick -> STATIC_OK, UNIT_PASSED tests=549 (390 backend pytest + 159 frontend vitest). .factory/holdout/run.py -> HOLDOUT_PASSED scenarios=3 assertions=9. harness/mutations/run.py -> MUTATIONS_TOTAL=4 MUTATIONS_CAUGHT=4 MUTATIONS_NOT_INJECTED=0.",
+
+  "_e2e_steps_deliberately_absent": "There is no e2e floor here because the number has never been measured. harness/e2e.py asserts five HTTP-level checks, but running them needs the validation env that lives outside the repo, and this machine does not have it. Writing 5 here would be a floor nobody has ever observed the harness clear - which is the same class of claim this whole directory exists to refuse. Measure it on the VPS, then add the line.",
+
+  "_independence_2026_08_13": "Of the four mutations, ONE is caught above the independence line (lock-key-is-constant, by the holdout). The other three are caught by static or unit, both of which the builder can read and edit. That number is 1, it should be higher, and the honest reading is that this gate currently depends mostly on checks inside the agent's optimisation loop. The first three defects were originally ALL caught by static because they broke type-checking rather than behaviour; making one of them type-clean is what moved it above the line. The remaining two are worth the same treatment.",
+
+  "_known_gap": "No floor covers the agent-browser journey in FACTORY_RULES section 4, because that journey lives in the validate-pr workflow rather than in harness/. Until it moves, the most valuable assertions in this factory are outside the ratchet entirely.",
+
+  "_raise_these": "On the same human commit that adds the assertions. If you find yourself lowering one, the question is what stopped being true."
+}

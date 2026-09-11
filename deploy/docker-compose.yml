@@ -1,0 +1,152 @@
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: dynachat-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./upstream.conf:/etc/caddy/upstream.conf:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    # No extra_hosts — the app now lives in-network and is reachable by
+    # service name (app-blue / app-green). upstream.conf switches between them.
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: dynachat-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- Blue/green app services --------------------------------------------
+  # Identical except for name. /opt/dynachat/deploy.sh rebuilds the inactive
+  # color, waits for its healthcheck, then rewrites upstream.conf and does a
+  # graceful `caddy reload` to swap. Neither publishes a host port — Caddy
+  # reaches them via the internal docker network by service name.
+  #
+  app-blue:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: dynachat-app:latest
+    container_name: dynachat-app-blue
+    restart: unless-stopped
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      SUPADATA_API_KEY: ${SUPADATA_API_KEY:-}
+      YOUTUBE_CHANNEL_ID: ${YOUTUBE_CHANNEL_ID:-}
+      CHANNEL_SYNC_TYPE: ${CHANNEL_SYNC_TYPE:-video}
+      FRONTEND_DIST: /app/frontend/dist
+      # DATABASE_URL is now the sole database connection (no SQLite).
+      # Points at the in-compose postgres service by DNS name.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_USER_EMAIL: ${ADMIN_USER_EMAIL:-}
+      # Issue #147: Circle membership verification + Dynamous content ingest.
+      CIRCLE_ADMIN_TOKEN: ${CIRCLE_ADMIN_TOKEN:-}
+      CIRCLE_PAID_ACCESS_GROUP_ID: ${CIRCLE_PAID_ACCESS_GROUP_ID:-}
+      MEMBERSHIP_REFRESH_SECONDS: ${MEMBERSHIP_REFRESH_SECONDS:-3600}
+      DYNAMOUS_CONTENT_DIR: /app/content/dynamous
+      # Inject the video catalog into the cached system prompt so the LLM
+      # can map curriculum identifiers ("lesson 1.6", "module 7", "workshop
+      # #4") onto real video titles before retrieving. Default off so
+      # tighter prompt-cache budgets are unaffected; flip on per-deploy.
+      CATALOG_ENABLED: ${CATALOG_ENABLED:-false}
+      CATALOG_TIER: ${CATALOG_TIER:-standard}
+      CATALOG_CACHE_TTL_SECONDS: ${CATALOG_CACHE_TTL_SECONDS:-3600}
+      # OpenRouter chat model + optional reasoning effort override. Defaults
+      # match the prod baseline; canary deploys override these to test new
+      # models on the inactive blue/green slot before flipping Caddy.
+      CHAT_MODEL: ${CHAT_MODEL:-anthropic/claude-sonnet-4.6}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
+    volumes:
+      # Read-only mount of the host-side dynamous-content checkout. The host's
+      # deploy.sh git-clones / pulls this directory before bringing the new
+      # color up. Path is parameterised so it can point at /opt/dynachat/dynamous-content
+      # in prod or a dev fixture in local testing. Empty/missing dir is fine —
+      # ingest_dynamous_content skips if the directory is absent.
+      - ${DYNAMOUS_CONTENT_HOST_PATH:-/opt/dynachat/dynamous-content}:/app/content/dynamous:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  app-green:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: dynachat-app:latest
+    container_name: dynachat-app-green
+    restart: unless-stopped
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      SUPADATA_API_KEY: ${SUPADATA_API_KEY:-}
+      YOUTUBE_CHANNEL_ID: ${YOUTUBE_CHANNEL_ID:-}
+      CHANNEL_SYNC_TYPE: ${CHANNEL_SYNC_TYPE:-video}
+      FRONTEND_DIST: /app/frontend/dist
+      # DATABASE_URL is now the sole database connection (no SQLite).
+      # Points at the in-compose postgres service by DNS name.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_USER_EMAIL: ${ADMIN_USER_EMAIL:-}
+      # Issue #147: Circle membership verification + Dynamous content ingest.
+      CIRCLE_ADMIN_TOKEN: ${CIRCLE_ADMIN_TOKEN:-}
+      CIRCLE_PAID_ACCESS_GROUP_ID: ${CIRCLE_PAID_ACCESS_GROUP_ID:-}
+      MEMBERSHIP_REFRESH_SECONDS: ${MEMBERSHIP_REFRESH_SECONDS:-3600}
+      DYNAMOUS_CONTENT_DIR: /app/content/dynamous
+      # Inject the video catalog into the cached system prompt so the LLM
+      # can map curriculum identifiers ("lesson 1.6", "module 7", "workshop
+      # #4") onto real video titles before retrieving. Default off so
+      # tighter prompt-cache budgets are unaffected; flip on per-deploy.
+      CATALOG_ENABLED: ${CATALOG_ENABLED:-false}
+      CATALOG_TIER: ${CATALOG_TIER:-standard}
+      CATALOG_CACHE_TTL_SECONDS: ${CATALOG_CACHE_TTL_SECONDS:-3600}
+      # OpenRouter chat model + optional reasoning effort override. Defaults
+      # match the prod baseline; canary deploys override these to test new
+      # models on the inactive blue/green slot before flipping Caddy.
+      CHAT_MODEL: ${CHAT_MODEL:-anthropic/claude-sonnet-4.6}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
+    volumes:
+      - ${DYNAMOUS_CONTENT_HOST_PATH:-/opt/dynachat/dynamous-content}:/app/content/dynamous:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)"
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgres_data:
+  app_data:

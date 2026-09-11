@@ -1,0 +1,281 @@
+name: benchmark-evaluator
+description: |
+  Use when: Scoring a benchmark PR against 7 dimensions on a 1-10 scale.
+  Does: Fetches PR + linked issue + diff. Runs Opus once with structured
+        output. Writes evaluation.json. Posts a formatted comment on the PR
+        with the scoreboard and verdict.
+  Argument: PR number (e.g. `benchmark-evaluator "#42"`).
+
+# Opus for judgment — this is where you want the strongest critic.
+provider: claude
+model: opus
+
+nodes:
+  - id: fetch-pr
+    bash: |
+      set -euo pipefail
+      PR_NUMBER=$(echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+      if [ -z "$PR_NUMBER" ]; then
+        echo "ERROR: No PR number in arguments: $ARGUMENTS" >&2
+        exit 1
+      fi
+      echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"
+      gh pr view "$PR_NUMBER" --json number,title,body,headRefName,additions,deletions,changedFiles,labels,author
+    timeout: 20000
+
+  - id: fetch-diff
+    bash: |
+      set -euo pipefail
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number")
+      gh pr diff "$PR_NUMBER" | head -3000
+    depends_on: [fetch-pr]
+    timeout: 30000
+
+  - id: fetch-issue
+    bash: |
+      set -euo pipefail
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number")
+      ISSUE_NUM=$(gh pr view "$PR_NUMBER" --json body -q '.body' \
+        | grep -oiE '(fixes|closes|resolves) #[0-9]+' \
+        | grep -oE '[0-9]+' | head -1)
+      if [ -n "$ISSUE_NUM" ]; then
+        gh issue view "$ISSUE_NUM" --json number,title,body
+      else
+        echo '{"error":"No linked issue found in PR body."}'
+      fi
+    depends_on: [fetch-pr]
+    timeout: 20000
+
+  - id: fetch-commit-log
+    bash: |
+      set -euo pipefail
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number")
+      # Get the head ref + base ref, then show the commits
+      HEAD_REF=$(gh pr view "$PR_NUMBER" --json headRefName -q '.headRefName')
+      BASE_REF=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      git fetch origin "$HEAD_REF" "$BASE_REF" 2>/dev/null || true
+      git log --oneline --no-merges "origin/${BASE_REF}..origin/${HEAD_REF}" 2>/dev/null | head -20
+    depends_on: [fetch-pr]
+    timeout: 20000
+
+  # Pull the source workflow's plan.md + exploration.md so the evaluator can
+  # score plan_impl_fidelity properly. The benchmark workflow stamped its own
+  # run-id into the PR body via "Source run-id: <uuid>" — we extract that and
+  # copy the corresponding artifacts into this evaluator's $ARTIFACTS_DIR.
+  - id: fetch-source-artifacts
+    bash: |
+      set -euo pipefail
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number")
+      PR_BODY=$(gh pr view "$PR_NUMBER" --json body -q '.body')
+
+      # Extract the UUID after "Source run-id:" — tolerant of backticks + whitespace
+      RUN_ID=$(echo "$PR_BODY" | grep -oE 'Source run-id:[^a-f0-9]*[a-f0-9-]{36}' | grep -oE '[a-f0-9-]{36}' | head -1)
+
+      if [ -z "$RUN_ID" ]; then
+        echo "WARNING: no Source run-id found in PR body; plan_impl_fidelity will default to not-visible"
+        exit 0
+      fi
+
+      # Archon stores artifacts at this path per the smoke-test verification on 2026-05-20
+      SOURCE_DIR="$HOME/.archon/workspaces/coleam00/dark-factory-experiment/artifacts/runs/$RUN_ID"
+
+      if [ ! -d "$SOURCE_DIR" ]; then
+        echo "WARNING: source artifacts dir not found: $SOURCE_DIR"
+        exit 0
+      fi
+
+      cp "$SOURCE_DIR/plan.md" "$ARTIFACTS_DIR/source-plan.md" 2>/dev/null && echo "Copied plan.md" || echo "(no source plan.md)"
+      cp "$SOURCE_DIR/exploration.md" "$ARTIFACTS_DIR/source-exploration.md" 2>/dev/null && echo "Copied exploration.md" || echo "(no source exploration.md)"
+      echo "Source run-id: $RUN_ID"
+    depends_on: [fetch-pr]
+    timeout: 15000
+
+  - id: evaluate
+    prompt: |
+      You are Cole's second brain, scoring a benchmark PR. This PR was produced
+      by an experimental workflow that varies which model handles planning vs
+      implementation. Your job is to score the PR on 7 dimensions so we can
+      compare cells objectively.
+
+      ## Original Issue
+      $fetch-issue.output
+
+      ## PR Metadata
+      $fetch-pr.output
+
+      ## PR Diff
+      $fetch-diff.output
+
+      ## Commit Log (shows split between impl + self-review)
+      $fetch-commit-log.output
+
+      ## Source workflow artifacts
+
+      The benchmark workflow that produced this PR wrote its planning artifacts
+      to disk. They have been copied into this evaluator's artifacts dir:
+
+      - `$ARTIFACTS_DIR/source-plan.md` — the plan the benchmark's `plan` node
+        produced. Use the Read tool to load it. If it doesn't exist (silent),
+        plan-fidelity can't be scored — fall back to "not visible".
+      - `$ARTIFACTS_DIR/source-exploration.md` — the codebase exploration the
+        benchmark's `explore` node produced. Optional context.
+
+      ## Instructions
+
+      Score each of the 7 dimensions on a 1-10 scale with a 1-2 sentence rationale.
+      Be honest — if the PR is bad, score it low and say why. If it's excellent,
+      score it high and say why. Use the full range; don't cluster around 6-7.
+
+      ### Dimensions
+
+      1. **solves_issue** — Does the fix actually address what the issue asked for?
+         10 = exactly solves the stated problem. 1 = doesn't solve it at all.
+      2. **root_cause** — Structurally sound fix, or band-aid that papers over
+         the symptom? 10 = true root cause. 1 = pure bandaid.
+      3. **scope_discipline** — Touched only what was needed?
+         10 = surgical, only relevant files. 1 = sprawling, lots of unrelated changes.
+      4. **subtle_correctness** — Edge cases, async/await, types, no foot-guns
+         introduced. 10 = thoughtful about subtle failure modes. 1 = obvious bugs.
+      5. **code_quality** — Readable, well-named, idiomatic to this codebase.
+         10 = production-grade. 1 = sloppy.
+      6. **test_discipline** — Meaningful tests added for the change, or existing
+         tests gamed? 10 = good targeted tests. 1 = no tests / tests modified to pass.
+      7. **plan_impl_fidelity** — Read `$ARTIFACTS_DIR/source-plan.md`. Compare
+         what was planned against what the diff actually delivered. 10 = the
+         implementation faithfully executes the plan. 5 = partial drift (some
+         items planned but not done, or done items not in the plan). 1 = plan
+         and impl diverge completely. If `source-plan.md` doesn't exist on disk,
+         score 5 and note "not visible (source-plan.md not present)".
+
+      ### Write your output to TWO places:
+
+      1. The structured JSON (Archon collects this via output_format).
+      2. A pretty-printed copy at `$ARTIFACTS_DIR/evaluation.json` — same
+         structure as the output_format, for the next node to read without
+         worrying about Archon's substitution quoting.
+
+      Use the Write tool to create `$ARTIFACTS_DIR/evaluation.json` with this exact shape:
+
+      ```json
+      {
+        "scores": {
+          "solves_issue":       { "score": N, "rationale": "..." },
+          "root_cause":         { "score": N, "rationale": "..." },
+          "scope_discipline":   { "score": N, "rationale": "..." },
+          "subtle_correctness": { "score": N, "rationale": "..." },
+          "code_quality":       { "score": N, "rationale": "..." },
+          "test_discipline":    { "score": N, "rationale": "..." },
+          "plan_impl_fidelity": { "score": N, "rationale": "..." }
+        },
+        "total": N,
+        "verdict": "1-2 paragraph summary of strengths and weaknesses."
+      }
+      ```
+
+      `total` is the sum of the 7 dimension scores (out of 70).
+    depends_on: [fetch-issue, fetch-diff, fetch-commit-log, fetch-source-artifacts]
+    context: fresh
+    output_format:
+      type: object
+      properties:
+        scores:
+          type: object
+          properties:
+            solves_issue:
+              type: object
+              properties:
+                score: { type: number }
+                rationale: { type: string }
+              required: [score, rationale]
+            root_cause:
+              type: object
+              properties:
+                score: { type: number }
+                rationale: { type: string }
+              required: [score, rationale]
+            scope_discipline:
+              type: object
+              properties:
+                score: { type: number }
+                rationale: { type: string }
+              required: [score, rationale]
+            subtle_correctness:
+              type: object
+              properties:
+                score: { type: number }
+                rationale: { type: string }
+              required: [score, rationale]
+            code_quality:
+              type: object
+              properties:
+                score: { type: number }
+                rationale: { type: string }
+              required: [score, rationale]
+            test_discipline:
+              type: object
+              properties:
+                score: { type: number }
+                rationale: { type: string }
+              required: [score, rationale]
+            plan_impl_fidelity:
+              type: object
+              properties:
+                score: { type: number }
+                rationale: { type: string }
+              required: [score, rationale]
+          required:
+            - solves_issue
+            - root_cause
+            - scope_discipline
+            - subtle_correctness
+            - code_quality
+            - test_discipline
+            - plan_impl_fidelity
+        total:
+          type: number
+        verdict:
+          type: string
+      required: [scores, total, verdict]
+
+  - id: post-eval-comment
+    bash: |
+      set -euo pipefail
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number")
+      EVAL_FILE="$ARTIFACTS_DIR/evaluation.json"
+
+      if [ ! -f "$EVAL_FILE" ]; then
+        echo "ERROR: evaluation.json not found at $EVAL_FILE" >&2
+        exit 1
+      fi
+
+      TOTAL=$(jq -r '.total' "$EVAL_FILE")
+      VERDICT=$(jq -r '.verdict' "$EVAL_FILE")
+
+      # Build markdown table from scores
+      TABLE=$(jq -r '
+        .scores | to_entries[]
+        | "| \(.key) | \(.value.score)/10 | \(.value.rationale) |"
+      ' "$EVAL_FILE")
+
+      # Compose the comment
+      COMMENT=$(cat <<EOF
+      **Benchmark Evaluator** — score: **${TOTAL}/70**
+
+      ${VERDICT}
+
+      ## Scores
+
+      | Dimension | Score | Rationale |
+      |---|---|---|
+      ${TABLE}
+
+      ---
+      *Posted by \`benchmark-evaluator\` workflow.*
+      EOF
+      )
+
+      # Post as PR comment
+      gh pr comment "$PR_NUMBER" --body "$COMMENT"
+      echo "Posted evaluation to PR #${PR_NUMBER}: total=${TOTAL}/70"
+    depends_on: [evaluate]
+    timeout: 30000
